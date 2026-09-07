@@ -26,11 +26,29 @@ import (
 // this repo.
 func TestServerInstructionsStaysUnderClientTruncationLimit(t *testing.T) {
 	const clientTruncationCeiling = 2048
-	runes := utf8.RuneCountInString(serverInstructions)
-	t.Logf("serverInstructions rune count: %d (byte count: %d)", runes, len(serverInstructions))
-	if runes >= clientTruncationCeiling {
-		t.Errorf("serverInstructions is %d runes (>=%d) — exceeds the documented 2048-rune MCP client truncation ceiling. Trim prose.",
-			runes, clientTruncationCeiling)
+
+	profiles := map[string]map[string]bool{
+		"all (nil)": nil,
+		"agent":     ProfileAgent,
+		"admin":     ProfileAdmin,
+		"empty":     {},
+		"custom": {
+			"mem_save":   true,
+			"mem_search": true,
+			"mem_judge":  true,
+		},
+	}
+
+	for name, allowlist := range profiles {
+		t.Run(name, func(t *testing.T) {
+			instructions := buildServerInstructions(allowlist)
+			runes := utf8.RuneCountInString(instructions)
+			t.Logf("profile %q instructions rune count: %d (byte count: %d)", name, runes, len(instructions))
+			if runes >= clientTruncationCeiling {
+				t.Errorf("profile %q instructions is %d runes (>=%d) — exceeds the documented 2048-rune MCP client truncation ceiling. Trim prose.",
+					name, runes, clientTruncationCeiling)
+			}
+		})
 	}
 }
 
@@ -42,5 +60,18 @@ func TestServerInstructionsUsesCandidateJudgmentIDs(t *testing.T) {
 	warningIndex := strings.Index(serverInstructions, topLevelWarning)
 	if candidateIndex < 0 || warningIndex < candidateIndex {
 		t.Errorf("serverInstructions must require each candidate's judgment_id and prohibit reusing the top-level judgment_id")
+	}
+}
+
+func TestServerInstructionsDeliveryGuarantee(t *testing.T) {
+	for _, requirement := range []string{
+		"Memory operations are internal bookkeeping, never the user-facing answer.",
+		"Complete required memory work before composing the completed-task reply;",
+		"send the complete answer as the final message of the turn with no later tool calls.",
+		"If memory work fails or needs follow-up, still send the answer.",
+	} {
+		if !strings.Contains(serverInstructions, requirement) {
+			t.Errorf("server instructions missing delivery guarantee: %q", requirement)
+		}
 	}
 }

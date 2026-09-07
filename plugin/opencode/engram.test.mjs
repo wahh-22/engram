@@ -29,8 +29,15 @@ function sdkLookup(sessions) {
   return ({ path }) => sdkResult(sessions.get(path.id))
 }
 
-function httpResponse(data = { status: "created" }, ok = true, onJSON) {
-  return { ok, async json() { onJSON?.(); return data } }
+function httpResponse(data = { status: "created" }, ok = true, onJSON, jsonError) {
+  return {
+    ok,
+    async json() {
+      onJSON?.()
+      if (jsonError) throw jsonError
+      return data
+    },
+  }
 }
 
 function deferredEvent() {
@@ -98,10 +105,14 @@ async function createRuntime(t, {
   directory = "/work/engram",
   projectCurrentResponse = { project: "engram", project_source: "git_remote" },
 	projectCurrentOK = true,
-	manifestExists = false,
-  sessionGet = async ({ path }) => sdkResult(session(path.id)),
-  registrationResponse,
-  contextResponse,
+  manifestExists = false,
+   sessionGet = async ({ path }) => sdkResult(session(path.id)),
+    registrationResponse,
+    sessionEndResponse,
+    contextResponse,
+    nudgeSessionResponse,
+    nudgeObservationsResponse,
+    nudgeObservationsError,
 } = {}) {
   const originalFetch = globalThis.fetch
   const originalBun = globalThis.Bun
@@ -125,7 +136,7 @@ async function createRuntime(t, {
     const path = new URL(url).pathname
     if (path === "/health") return { ok: true, async json() { return { status: "ok" } } }
     const body = init?.body ? JSON.parse(init.body) : undefined
-    requests.push({ path, url: String(url), body })
+    requests.push({ path, url: String(url), method: init?.method, body })
 		if (path === "/project/current") {
 			const response = typeof projectCurrentResponse === "function" ? projectCurrentResponse() : projectCurrentResponse
 			return httpResponse(response, projectCurrentOK, () => startupEvents.push("project-current:response"))
@@ -134,6 +145,14 @@ async function createRuntime(t, {
       registeredIDs.push(body.id)
       if (registrationResponse) return registrationResponse(registeredIDs.length)
       return httpResponse()
+    }
+    if (path.startsWith("/sessions/") && path.endsWith("/end")) {
+      if (sessionEndResponse) return sessionEndResponse(requests.filter(({ path }) => path.startsWith("/sessions/") && path.endsWith("/end")).length)
+      return httpResponse({})
+    }
+    if (path.startsWith("/sessions/") && nudgeSessionResponse) return httpResponse(nudgeSessionResponse)
+    if (path === "/observations" && (nudgeObservationsResponse !== undefined || nudgeObservationsError)) {
+      return httpResponse(nudgeObservationsResponse, true, undefined, nudgeObservationsError)
     }
     if (path === "/context/compaction" && contextResponse) return contextResponse()
     return httpResponse({})
@@ -165,6 +184,7 @@ async function createRuntime(t, {
     chat: plugin["chat.message"],
     after: plugin["tool.execute.after"],
     compact: plugin["experimental.session.compacting"],
+    transform: plugin["experimental.chat.system.transform"],
     registeredIDs,
     sessionGetIDs,
     requests,
@@ -172,6 +192,29 @@ async function createRuntime(t, {
 		startupEvents,
   }
 }
+
+test("save nudge fails closed for malformed and non-array observation responses", async (t) => {
+  for (const scenario of [
+    { name: "malformed JSON", error: new SyntaxError("unexpected end of JSON input") },
+    { name: "non-array JSON", response: { observations: [] } },
+    { name: "non-empty observation without timestamp", response: [{}] },
+    { name: "non-empty observation with null timestamp", response: [{ created_at: null }] },
+    { name: "non-empty observation with non-string timestamp", response: [{ created_at: 42 }] },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const runtime = await createRuntime(t, {
+        nudgeSessionResponse: { started_at: new Date(Date.now() - 20 * 60 * 1000).toISOString() },
+        nudgeObservationsResponse: scenario.response,
+        nudgeObservationsError: scenario.error,
+      })
+      const output = { system: ["base system prompt"] }
+
+      await runtime.transform({ sessionID: "root" }, output)
+
+      assert.doesNotMatch(output.system[0], /MEMORY REMINDER/)
+    })
+  }
+})
 
 test("project identity delegates Windows paths and worktrees to the canonical server", async (t) => {
   for (const scenario of [
@@ -347,6 +390,23 @@ test("write tool hook binds only the four attributed writes to authoritative run
   assert.doesNotMatch(source, /delete output\.args\.session_id/)
   assert.match(source, /throw new Error/)
   assert.doesNotMatch(source, /knownSessions\.add\(sessionId\)[\s\S]{0,160}await engramFetch\("\/sessions"/)
+})
+
+test("qualified Engram write IDs inject the authoritative root session", async (t) => {
+  const runtime = await createRuntime(t, { sessionGet: sdkLookup(CHILD_SESSIONS) })
+  for (const { tool, sessionID, expectedSessionID } of [
+    { tool: "engram_mem_save", sessionID: "root", expectedSessionID: "root" },
+    { tool: "engram_mem_save_prompt", sessionID: "root", expectedSessionID: "root" },
+    { tool: "engram_mem_session_summary", sessionID: "leaf", expectedSessionID: "root" },
+    { tool: "engram_mem_capture_passive", sessionID: "root", expectedSessionID: "root" },
+  ]) {
+    const output = toolOutput(undefined)
+    await runtime.before({ tool, sessionID }, output)
+    assert.equal(output.args.session_id, expectedSessionID)
+  }
+
+  assert.deepEqual(runtime.sessionGetIDs, ["root", "leaf"])
+  assert.deepEqual(runtime.registeredIDs, ["root"], "a child must reuse its authoritative root")
 })
 
 test("subagent sessions resolve to the authoritative parent and never register themselves", () => {
@@ -835,6 +895,54 @@ test("a title-only session.created event registers an authoritative root", async
   assert.equal(output.args.session_id, "legitimate-root")
   assert.deepEqual(runtime.registeredIDs, ["legitimate-root"])
   assert.deepEqual(runtime.sessionGetIDs, [], "event-cached roots must not query the SDK")
+})
+
+test("deleting a registered root ends its encoded Engram session before invalidation", async (t) => {
+  const sessionID = "root/with space"
+  const runtime = await createRuntime(t)
+  await runtime.event("session.created", session(sessionID))
+  await runtime.event("session.deleted", { id: sessionID })
+
+  const endRequests = runtime.requests.filter(({ path }) => path.startsWith("/sessions/") && path.endsWith("/end"))
+  assert.equal(endRequests.length, 1)
+  assert.equal(endRequests[0].method, "POST")
+  assert.equal(endRequests[0].path, `/sessions/${encodeURIComponent(sessionID)}/end`)
+
+  const output = toolOutput()
+  await assertNoForward(runtime.before({ tool: "mem_save", sessionID }, output), output)
+})
+
+test("deleting a child never ends the child or its root Engram session", async (t) => {
+  const runtime = await createRuntime(t)
+  await runtime.event("session.created", session("root"))
+  await runtime.event("session.created", session("child", "root"))
+  await runtime.event("session.deleted", { id: "child" })
+
+  assert.equal(runtime.requests.some(({ path }) => path.startsWith("/sessions/") && path.endsWith("/end")), false)
+})
+
+test("failed root session end retries on a duplicate deletion without confirming closure", async (t) => {
+  const runtime = await createRuntime(t, {
+    sessionEndResponse: (attempt) => attempt === 1
+      ? httpResponse({ error: "unavailable" }, false)
+      : httpResponse({}),
+  })
+  await runtime.event("session.created", session("root"))
+  await runtime.event("session.deleted", { id: "root" })
+  await runtime.event("session.deleted", { id: "root" })
+
+  const endRequests = runtime.requests.filter(({ path }) => path === "/sessions/root/end")
+  assert.equal(endRequests.length, 2)
+})
+
+test("duplicate deletion does not repeat a confirmed root session end", async (t) => {
+  const runtime = await createRuntime(t)
+  await runtime.event("session.created", session("root"))
+  await runtime.event("session.deleted", { id: "root" })
+  await runtime.event("session.deleted", { id: "root" })
+
+  const endRequests = runtime.requests.filter(({ path }) => path === "/sessions/root/end")
+  assert.equal(endRequests.length, 1)
 })
 
 test("deleting a parent invalidates descendants and prevents later writes or re-registration", async (t) => {

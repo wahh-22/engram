@@ -46,6 +46,12 @@ const SESSION_ATTRIBUTED_WRITE_TOOLS = new Set([
   "mem_capture_passive",
 ])
 
+// OpenCode qualifies MCP tool IDs as <server>_<tool>; only normalize Engram's.
+function canonicalEngramToolName(tool: string): string {
+  const canonical = tool.toLowerCase()
+  return canonical.startsWith("engram_") ? canonical.slice("engram_".length) : canonical
+}
+
 // ─── Memory Instructions ─────────────────────────────────────────────────────
 // These get injected into the agent's context so it knows to call mem_save.
 
@@ -66,7 +72,7 @@ Call \`mem_save\` IMMEDIATELY after any of these:
 Format for \`mem_save\`:
 - **title**: Verb + what — short, searchable (e.g. "Fixed N+1 query in UserList", "Chose Zustand over Redux")
 - **type**: bugfix | decision | architecture | discovery | pattern | config | preference
-- **scope**: \`project\` (default) | \`personal\`
+- **scope**: \`project\` (default) | \`personal\` | \`global\`
 - **topic_key** (optional, recommended for evolving decisions): stable key like \`architecture/auth-model\`
 - **content**:
   **What**: One sentence — what was done
@@ -79,6 +85,10 @@ Topic rules:
 - Reuse the same \`topic_key\` to update an evolving topic instead of creating new observations
 - If unsure about the key, call \`mem_suggest_topic_key\` first and then reuse it
 - Use \`mem_update\` when you have an exact observation ID to correct
+
+### DELIVERY GUARANTEE
+
+Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
 
 ### WHEN TO SEARCH MEMORY
 
@@ -199,6 +209,37 @@ function stripPrivateTags(str: string): string {
   return str.replace(/<private>[\s\S]*?<\/private>/gi, "[REDACTED]").trim()
 }
 
+// SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" in UTC with no zone
+// suffix; new Date() would parse that as local time. Normalize to UTC first so
+// the thresholds are correct in every timezone.
+function toEpochSecs(ts: string): number | null {
+  if (!ts) return null
+  const normalized = ts.replace(" ", "T")
+  const utcTimestamp = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized : `${normalized}Z`
+  const ms = new Date(utcTimestamp).getTime()
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000)
+}
+
+// A successful empty list is the only response that proves a project has never
+// saved an observation. Every other incomplete observation response fails closed.
+export function shouldNudgeForObservations(
+  observationsResponseOK: boolean,
+  observations: unknown,
+  nowSecs: number,
+  sessionStartEpoch: number | null
+): boolean {
+  if (!observationsResponseOK || !Array.isArray(observations)) return false
+  if (observations.length === 0) {
+    return sessionStartEpoch !== null && sessionStartEpoch > 0 && nowSecs - sessionStartEpoch >= 900
+  }
+
+  const createdAt = observations[0]?.created_at
+  if (typeof createdAt !== "string") return false
+
+  const lastObsEpoch = toEpochSecs(createdAt)
+  return lastObsEpoch !== null && nowSecs - lastObsEpoch >= 900
+}
+
 // ─── Plugin Export ───────────────────────────────────────────────────────────
 
 export const Engram: Plugin = async (ctx) => {
@@ -239,6 +280,12 @@ export const Engram: Plugin = async (ctx) => {
   // This prevents late hooks or events from reviving an expired runtime chain.
   const invalidSessions = new Set<string>()
 
+  // Terminal root closures are retained after invalidation so duplicate deletion
+  // events can retry a failed endpoint call without treating it as confirmed.
+  const deletedRootSessions = new Set<string>()
+  const closedSessions = new Set<string>()
+  const closingSessions = new Map<string, Promise<boolean>>()
+
   function invalidateSessionTree(sessionId: string): void {
     const invalidated = new Set([sessionId])
     let foundDescendant = true
@@ -260,6 +307,33 @@ export const Engram: Plugin = async (ctx) => {
       toolCounts.delete(invalidID)
       lastNudgeTime.delete(invalidID)
     }
+  }
+
+  function isKnownAuthoritativeRootSession(sessionId: string): boolean {
+    return knownSessions.has(sessionId) && parentSessions.get(sessionId) === null
+  }
+
+  async function closeDeletedRootSession(sessionId: string): Promise<boolean> {
+    if (closedSessions.has(sessionId)) return true
+    if (!deletedRootSessions.has(sessionId)) {
+      if (!isKnownAuthoritativeRootSession(sessionId)) return false
+      deletedRootSessions.add(sessionId)
+    }
+
+    const inFlight = closingSessions.get(sessionId)
+    if (inFlight) return inFlight
+
+    const close = engramFetch(`/sessions/${encodeURIComponent(sessionId)}/end`, {
+      method: "POST",
+    }).then((acknowledgement) => {
+      if (acknowledgement === null) return false
+      closedSessions.add(sessionId)
+      return true
+    }).finally(() => {
+      closingSessions.delete(sessionId)
+    })
+    closingSessions.set(sessionId, close)
+    return close
   }
 
   function cacheSessionInfo(info: { id?: unknown; parentID?: unknown; projectID?: unknown } | undefined): boolean {
@@ -466,6 +540,9 @@ export const Engram: Plugin = async (ctx) => {
         const info = (event.properties as any)?.info
         const sessionId = info?.id
         if (sessionId) {
+          // Only a registered, event-validated root owns an Engram lifecycle.
+          // Await the best-effort endpoint before invalidating local ownership.
+          await closeDeletedRootSession(sessionId)
           invalidateSessionTree(sessionId)
         }
       }
@@ -520,7 +597,7 @@ export const Engram: Plugin = async (ctx) => {
     // the passive capture endpoint so the server extracts learnings.
 
     "tool.execute.before": async (input, output) => {
-      if (!SESSION_ATTRIBUTED_WRITE_TOOLS.has(input.tool.toLowerCase())) return
+      if (!SESSION_ATTRIBUTED_WRITE_TOOLS.has(canonicalEngramToolName(input.tool))) return
       const authoritativeSessionID = await resolveAuthoritativeSessionID(input.sessionID)
       if (!authoritativeSessionID) {
         throw new Error(`gentle-engram could not resolve an authoritative OpenCode runtime session for ${input.tool}`)
@@ -538,7 +615,7 @@ export const Engram: Plugin = async (ctx) => {
     },
 
     "tool.execute.after": async (input, output) => {
-      if (ENGRAM_TOOLS.has(input.tool.toLowerCase())) return
+      if (ENGRAM_TOOLS.has(canonicalEngramToolName(input.tool))) return
 
       // input.sessionID comes from OpenCode — always available
       const sessionId = await resolveAuthoritativeSessionID(input.sessionID)
@@ -591,16 +668,6 @@ export const Engram: Plugin = async (ctx) => {
         const sessionID: string = input.sessionID ?? ""
         if (!sessionID || invalidSessions.has(sessionID) || subAgentSessions.has(sessionID)) return
 
-        // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" in UTC with no
-        // zone suffix; new Date() would parse that as local time. Normalize to
-        // UTC first so the thresholds are correct in every timezone.
-        const toEpochSecs = (ts: string): number => {
-          if (!ts) return 0
-          const normalized = ts.includes("T") ? ts : ts.replace(" ", "T") + "Z"
-          const ms = new Date(normalized).getTime()
-          return Number.isNaN(ms) ? 0 : Math.floor(ms / 1000)
-        }
-
         const cooldownSecs = parseInt(process.env.ENGRAM_NUDGE_COOLDOWN_SECS ?? "900", 10)
         const nowSecs = Math.floor(Date.now() / 1000)
 
@@ -609,7 +676,7 @@ export const Engram: Plugin = async (ctx) => {
         if (lastNudge !== undefined && nowSecs - lastNudge < cooldownSecs) return
 
         // Skip if the session is too young (< 5 minutes)
-        let sessionStartEpoch = 0
+        let sessionStartEpoch: number | null = null
         try {
           const sessionRes = await fetch(`${ENGRAM_URL}/sessions/${encodeURIComponent(sessionID)}`, {
             signal: AbortSignal.timeout(200),
@@ -625,36 +692,30 @@ export const Engram: Plugin = async (ctx) => {
           // Server unreachable or timed out — skip nudge
           return
         }
-        if (sessionStartEpoch > 0 && nowSecs - sessionStartEpoch < 300) return
+        if (sessionStartEpoch !== null && sessionStartEpoch > 0 && nowSecs - sessionStartEpoch < 300) return
 
         // Check when the last observation was saved for this project
-        let lastObsEpoch = 0
+        let obsData: unknown
+        let observationsResponseOK = false
         try {
           const obsRes = await fetch(
             `${ENGRAM_URL}/observations?project=${encodeURIComponent(project)}&limit=1&sort=created_at:desc`,
             { signal: AbortSignal.timeout(200) }
           )
           if (obsRes.ok) {
-            const obsData = await obsRes.json()
-            const createdAt: string = obsData?.[0]?.created_at ?? ""
-            if (createdAt) {
-              lastObsEpoch = toEpochSecs(createdAt)
-            }
+            observationsResponseOK = true
+            obsData = await obsRes.json()
           }
         } catch {
           // Server unreachable or timed out — skip nudge
           return
         }
 
-        // No observations yet — nothing to nudge about
-        if (lastObsEpoch === 0) return
-
-        // Only nudge if last save was more than 15 minutes ago
-        if (nowSecs - lastObsEpoch < 900) return
+        if (!shouldNudgeForObservations(observationsResponseOK, obsData, nowSecs, sessionStartEpoch)) return
 
         // Append the nudge to the last system message
         const nudge =
-          "\n\nMEMORY REMINDER: It's been over 15 minutes since your last memory save. " +
+          "\n\nMEMORY REMINDER: It's been at least 15 minutes since your last memory save. " +
           "If you've made decisions, discoveries, completed significant work, or found non-obvious things, " +
           "call mem_save now."
         if (output.system.length > 0) {

@@ -15,22 +15,24 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
-	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
-	"github.com/Gentleman-Programming/engram/internal/timeutil"
+	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
+	"github.com/Gentleman-Programming/engram/v2/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
-
-var openDB = sql.Open
 
 // sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
 // constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
@@ -52,12 +54,15 @@ var sqliteWriteRetryBackoffs = []time.Duration{
 var (
 	ErrSessionNotFound             = errors.New("session not found")
 	ErrSessionIDRequired           = errors.New("session id is required")
+	ErrSessionAlreadyEnded         = errors.New("session has already ended")
 	ErrSessionHasObservations      = errors.New("session still has observations")
 	ErrSessionDeleteBlocked        = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound         = errors.New("observation not found")
 	ErrPromptNotFound              = errors.New("prompt not found")
 	ErrProjectNotFound             = errors.New("project not found")
 	ErrProjectRequired             = errors.New("project identity is required")
+	ErrInvalidSessionOwnershipMode = errors.New("invalid session ownership mode")
+	ErrSessionOwnershipMismatch    = errors.New("session ownership does not match write project")
 	ErrProjectRescueInvalidRequest = errors.New("project rescue request is invalid")
 	// ErrProjectOwnershipAmbiguous is returned when an unowned session cannot
 	// adopt a write's project because it already parents records owned by a
@@ -96,13 +101,19 @@ var (
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type Session struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
+	ID            string  `json:"id"`
+	Project       string  `json:"project"`
+	OwnershipMode string  `json:"ownership_mode,omitempty"`
+	Directory     string  `json:"directory"`
+	StartedAt     string  `json:"started_at"`
+	EndedAt       *string `json:"ended_at,omitempty"`
+	Summary       *string `json:"summary,omitempty"`
 }
+
+const (
+	SessionOwnershipShared       = "shared"
+	SessionOwnershipProjectOwned = "project_owned"
+)
 
 type Observation struct {
 	ID             int64   `json:"id"`
@@ -132,10 +143,14 @@ const (
 
 // State returns the virtual lifecycle state derived from review_after.
 func (o Observation) State() string {
-	if o.ReviewAfter == nil || strings.TrimSpace(*o.ReviewAfter) == "" {
+	return observationState(o.ReviewAfter)
+}
+
+func observationState(reviewAfterValue *string) string {
+	if reviewAfterValue == nil || strings.TrimSpace(*reviewAfterValue) == "" {
 		return ObservationStateActive
 	}
-	reviewAfter, err := parseObservationTime(*o.ReviewAfter)
+	reviewAfter, err := parseObservationTime(*reviewAfterValue)
 	if err != nil {
 		return ObservationStateActive
 	}
@@ -148,6 +163,28 @@ func (o Observation) State() string {
 type SearchResult struct {
 	Observation
 	Rank float64 `json:"rank"`
+}
+
+// SearchPreviewResult is the bounded result shape used by preview-only callers.
+// Content is deliberately excluded so those callers do not hydrate full bodies.
+type SearchPreviewResult struct {
+	ID          int64   `json:"id"`
+	SyncID      string  `json:"sync_id"`
+	Type        string  `json:"type"`
+	Title       string  `json:"title"`
+	Preview     string  `json:"preview"`
+	Truncated   bool    `json:"truncated"`
+	Project     *string `json:"project,omitempty"`
+	Scope       string  `json:"scope"`
+	ReviewAfter *string `json:"review_after,omitempty"`
+	Pinned      bool    `json:"-"`
+	CreatedAt   string  `json:"created_at"`
+	Rank        float64 `json:"rank"`
+}
+
+// State returns the virtual lifecycle state derived from review_after.
+func (r SearchPreviewResult) State() string {
+	return observationState(r.ReviewAfter)
 }
 
 type SessionSummary struct {
@@ -297,7 +334,16 @@ type SyncState struct {
 	ReasonCode          *string `json:"reason_code,omitempty"`
 	ReasonMessage       *string `json:"reason_message,omitempty"`
 	LastError           *string `json:"last_error,omitempty"`
+	LastSuccessAt       *string `json:"last_success_at,omitempty"`
 	UpdatedAt           string  `json:"updated_at"`
+}
+
+// CloudSyncSummary is the aggregate local cloud state shown when no project is selected.
+type CloudSyncSummary struct {
+	LastSuccessAt    string
+	PendingMutations int64
+	LastError        string
+	ReasonCode       string
 }
 
 type SyncMutation struct {
@@ -420,15 +466,16 @@ type EnrolledProject struct {
 }
 
 type syncSessionPayload struct {
-	ID         string  `json:"id"`
-	Project    string  `json:"project"`
-	Directory  string  `json:"directory,omitempty"`
-	StartedAt  string  `json:"started_at,omitempty"`
-	EndedAt    *string `json:"ended_at,omitempty"`
-	Summary    *string `json:"summary,omitempty"`
-	Deleted    bool    `json:"deleted,omitempty"`
-	DeletedAt  *string `json:"deleted_at,omitempty"`
-	HardDelete bool    `json:"hard_delete,omitempty"`
+	ID            string  `json:"id"`
+	Project       string  `json:"project"`
+	OwnershipMode string  `json:"ownership_mode,omitempty"`
+	Directory     string  `json:"directory,omitempty"`
+	StartedAt     string  `json:"started_at,omitempty"`
+	EndedAt       *string `json:"ended_at,omitempty"`
+	Summary       *string `json:"summary,omitempty"`
+	Deleted       bool    `json:"deleted,omitempty"`
+	DeletedAt     *string `json:"deleted_at,omitempty"`
+	HardDelete    bool    `json:"hard_delete,omitempty"`
 }
 
 type syncObservationPayload struct {
@@ -538,12 +585,18 @@ func (s *Store) MaxObservationLength() int {
 	return s.cfg.MaxObservationLength
 }
 
+// DataDir returns the directory containing the store database and cloud.json.
+func (s *Store) DataDir() string {
+	return s.cfg.DataDir
+}
+
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 type Store struct {
-	db    *sql.DB
-	cfg   Config
-	hooks storeHooks
+	db         *sql.DB
+	cfg        Config
+	generation *databaseGeneration
+	hooks      storeHooks
 
 	repairMu        sync.Mutex
 	repairDone      bool
@@ -694,6 +747,15 @@ func (s *Store) commitHook(tx *sql.Tx) error {
 }
 
 func New(cfg Config) (*Store, error) {
+	return newStore(cfg)
+}
+
+// newWithoutRepair is retained as a test helper alias for New.
+func newWithoutRepair(cfg Config) (*Store, error) {
+	return newStore(cfg)
+}
+
+func newStore(cfg Config) (*Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
 	}
@@ -702,7 +764,14 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
-	db, err := openDB("sqlite", dbPath)
+	if err := ensureDatabaseFile(dbPath); err != nil {
+		return nil, fmt.Errorf("engram: create database file: %w", err)
+	}
+	generation, err := newDatabaseGeneration(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("engram: capture database generation: %w", err)
+	}
+	db, err := openDB(dbPath, generation)
 	if err != nil {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
@@ -714,63 +783,16 @@ func New(cfg Config) (*Store, error) {
 		}
 	}()
 
-	// SQLite performance pragmas
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA foreign_keys = ON",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
-		}
+	if err := primeConnection(db); err != nil {
+		return nil, err
 	}
 
-	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
-	if err := s.migrate(); err != nil {
-		return nil, fmt.Errorf("engram: migration: %w", err)
+	s := &Store{db: db, cfg: cfg, generation: generation, hooks: defaultStoreHooks()}
+	if err := s.runStartupMigrations(); err != nil {
+		return nil, err
 	}
 
 	succeeded = true
-	return s, nil
-}
-
-// newWithoutRepair is retained as a test helper alias for New. Enrolled-project
-// repair is deferred until the first synchronization operation in both cases.
-func newWithoutRepair(cfg Config) (*Store, error) {
-	if !filepath.IsAbs(cfg.DataDir) {
-		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
-	}
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		return nil, fmt.Errorf("engram: create data dir: %w", err)
-	}
-
-	dbPath := filepath.Join(cfg.DataDir, "engram.db")
-	db, err := openDB("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("engram: open database: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA foreign_keys = ON",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
-		}
-	}
-
-	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
-	if err := s.migrate(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("engram: migration: %w", err)
-	}
 	return s, nil
 }
 
@@ -780,11 +802,146 @@ func (s *Store) Close() error {
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
 
+// storeDSN builds the modernc.org/sqlite DSN for dbPath with the session
+// pragmas encoded as _pragma query parameters. The driver applies these to
+// every physical connection it opens, including replacement pool connections.
+func storeDSN(dbPath string) string {
+	q := url.Values{}
+	for _, p := range []string{
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+		"foreign_keys(1)",
+	} {
+		q.Add("_pragma", p)
+	}
+	if filepath.Separator == '/' {
+		return (&url.URL{Scheme: "file", Path: dbPath}).String() + "?" + q.Encode()
+	}
+	return dbPath + "?" + q.Encode()
+}
+
+var walSwitchRetryBackoffs = []time.Duration{
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+}
+
+// primeConnection opens the first physical connection with a bounded retry
+// while concurrent cold starts race the rollback-journal-to-WAL conversion.
+func primeConnection(db *sql.DB) error {
+	ctx := context.Background()
+	var conn *sql.Conn
+	var lastErr error
+	for attempt := 0; attempt <= len(walSwitchRetryBackoffs); attempt++ {
+		conn, lastErr = db.Conn(ctx)
+		if lastErr == nil {
+			break
+		}
+		if !isRetryableSQLiteLockError(lastErr) || attempt == len(walSwitchRetryBackoffs) {
+			return fmt.Errorf("engram: open initial connection: %w", lastErr)
+		}
+		time.Sleep(walSwitchRetryBackoffs[attempt])
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn any) error {
+		fc, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return fmt.Errorf("engram: driver connection %T does not implement sqlite.FileControl", driverConn)
+		}
+		mode, err := fc.FileControlPersistWAL("main", 1)
+		if err != nil {
+			return fmt.Errorf("engram: enable persistent WAL: %w", err)
+		}
+		if mode != 1 {
+			return fmt.Errorf("engram: persistent WAL not active (file control returned mode %d)", mode)
+		}
+		return nil
+	})
+}
+
+const schemaVersion = 1
+
+var migrateRunCount atomic.Int64
+var acquireStartupMigrationLock = acquireMigrationLock
+
+// runStartupMigrations serializes migrations and the every-open repair. It
+// never writes a database with a schema version newer than this binary.
+func (s *Store) runStartupMigrations() error {
+	return s.generation.withStartupChecks(func() error {
+		current, err := s.readUserVersion()
+		if err != nil {
+			return fmt.Errorf("engram: read user_version: %w", err)
+		}
+		if isFutureSchemaVersion(current) {
+			return nil
+		}
+		unlock, err := acquireStartupMigrationLock(filepath.Join(s.cfg.DataDir, ".migrate.lock"))
+		if err != nil {
+			return fmt.Errorf("engram: acquire migration lock: %w", err)
+		}
+		defer unlock()
+		if err := s.generation.check(); err != nil {
+			return fmt.Errorf("engram: check database generation after migration lock: %w", err)
+		}
+
+		// Re-read under the lock before deciding whether any startup write is safe:
+		// another process may have migrated this database, or a newer binary may
+		// have replaced it, while this process waited for the lock.
+		current, err = s.readUserVersion()
+		if err != nil {
+			return fmt.Errorf("engram: re-read user_version: %w", err)
+		}
+		if isFutureSchemaVersion(current) {
+			return nil
+		}
+
+		needsVersionStamp := current < schemaVersion
+		if needsVersionStamp {
+			migrateRunCount.Add(1)
+		}
+		if err := s.migrate(); err != nil {
+			return fmt.Errorf("engram: migration: %w", err)
+		}
+		if needsVersionStamp {
+			if err := s.setUserVersion(schemaVersion); err != nil {
+				return fmt.Errorf("engram: set user_version: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func isFutureSchemaVersion(current int) bool {
+	if current > schemaVersion {
+		log.Printf("[store] database schema version %d is newer than this binary's %d — skipping migrations (upgrade engram to manage this database)", current, schemaVersion)
+		return true
+	}
+	return false
+}
+
+func (s *Store) readUserVersion() (int, error) {
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func (s *Store) setUserVersion(v int) error {
+	_, err := s.execHook(s.db, fmt.Sprintf("PRAGMA user_version = %d", v))
+	return err
+}
+
 func (s *Store) migrate() error {
 	schema := `
 			CREATE TABLE IF NOT EXISTS sessions (
 				id         TEXT PRIMARY KEY,
 			project    TEXT NOT NULL,
+			ownership_mode TEXT,
 			directory  TEXT NOT NULL,
 			started_at TEXT NOT NULL DEFAULT (datetime('now')),
 			ended_at   TEXT,
@@ -825,6 +982,7 @@ func (s *Store) migrate() error {
 			type,
 			project,
 			topic_key,
+			tokenize='trigram',
 			content='observations',
 			content_rowid='id'
 		);
@@ -853,6 +1011,7 @@ func (s *Store) migrate() error {
 		CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
 			content,
 			project,
+			tokenize='trigram',
 			content='user_prompts',
 			content_rowid='id'
 		);
@@ -875,6 +1034,7 @@ func (s *Store) migrate() error {
 				lease_owner          TEXT,
 				lease_until          TEXT,
 				last_error           TEXT,
+				last_success_at      TEXT,
 				updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
 			);
 
@@ -938,8 +1098,24 @@ func (s *Store) migrate() error {
 	if err := s.migrateLegacyObservationsTable(); err != nil {
 		return err
 	}
+	if err := s.addColumnIfNotExists("sessions", "ownership_mode", "TEXT"); err != nil {
+		return err
+	}
+	// Legacy rows remain unclassified unless their persisted identity proves a
+	// deterministic manual-save owner. Never infer ownership from an ID alone.
+	if _, err := s.execHook(s.db, `
+		UPDATE sessions SET ownership_mode = CASE
+			WHEN id = 'manual-save-' || project AND ifnull(trim(project), '') <> '' THEN 'project_owned'
+			WHEN id NOT LIKE 'manual-save-%' AND ifnull(trim(project), '') <> '' THEN 'shared'
+			ELSE ownership_mode END
+		WHERE ownership_mode IS NULL`); err != nil {
+		return err
+	}
 
 	if err := s.addColumnIfNotExists("user_prompts", "sync_id", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.migrateFTS(); err != nil {
 		return err
 	}
 
@@ -978,6 +1154,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.addColumnIfNotExists("sync_state", "reason_message", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfNotExists("sync_state", "last_success_at", "TEXT"); err != nil {
 		return err
 	}
 	if err := s.migrateSyncChunksTable(); err != nil {
@@ -1113,74 +1292,11 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	// Create triggers to keep FTS in sync (idempotent check)
-	var name string
-	err := s.db.QueryRow(
-		"SELECT name FROM sqlite_master WHERE type='trigger' AND name='obs_fts_insert'",
-	).Scan(&name)
-
-	if err == sql.ErrNoRows {
-		triggers := `
-			CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
-				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
-			END;
-
-			CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
-				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
-			END;
-
-			CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
-				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
-				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
-			END;
-		`
-		if _, err := s.execHook(s.db, triggers); err != nil {
-			return err
-		}
-	}
-
-	if err := s.migrateFTSTopicKey(); err != nil {
-		return err
-	}
 	if err := s.withTx(func(tx *sql.Tx) error {
 		_, err := s.execHook(tx, `UPDATE observations SET project = CAST(project AS TEXT) WHERE typeof(project) = 'blob'`)
 		return err
 	}); err != nil {
 		return err
-	}
-
-	// Prompts FTS triggers (separate idempotent check)
-	var promptTrigger string
-	err = s.db.QueryRow(
-		"SELECT name FROM sqlite_master WHERE type='trigger' AND name='prompt_fts_insert'",
-	).Scan(&promptTrigger)
-
-	if err == sql.ErrNoRows {
-		promptTriggers := `
-			CREATE TRIGGER prompt_fts_insert AFTER INSERT ON user_prompts BEGIN
-				INSERT INTO prompts_fts(rowid, content, project)
-				VALUES (new.id, new.content, new.project);
-			END;
-
-			CREATE TRIGGER prompt_fts_delete AFTER DELETE ON user_prompts BEGIN
-				INSERT INTO prompts_fts(prompts_fts, rowid, content, project)
-				VALUES ('delete', old.id, old.content, old.project);
-			END;
-
-			CREATE TRIGGER prompt_fts_update AFTER UPDATE ON user_prompts BEGIN
-				INSERT INTO prompts_fts(prompts_fts, rowid, content, project)
-				VALUES ('delete', old.id, old.content, old.project);
-				INSERT INTO prompts_fts(rowid, content, project)
-				VALUES (new.id, new.content, new.project);
-			END;
-		`
-		if _, err := s.execHook(s.db, promptTriggers); err != nil {
-			return err
-		}
 	}
 
 	// Phase 3: add republish CLI, surface dead rows via mem_status.
@@ -1741,6 +1857,9 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		finding.Message = msg
 		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
 	}
+	if base.Project == "" || base.Project != mutation.Project {
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, "mutation project must be non-empty and canonical for cloud transport and cannot be inferred from authoritative local state"), nil
+	}
 
 	if payload == "" {
 		return blocked(UpgradeReasonBlockedLegacyMutationManual, "legacy mutation payload is empty"), nil
@@ -2191,60 +2310,214 @@ func normalizeUpgradeRepairClass(class string) string {
 	}
 }
 
-func (s *Store) migrateFTSTopicKey() error {
-	var colCount int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_xinfo('observations_fts') WHERE name = 'topic_key'").Scan(&colCount)
-	if err != nil || colCount > 0 {
-		return nil
-	}
+const observationsFTSDefinition = `
+	CREATE VIRTUAL TABLE observations_fts USING fts5(
+		title,
+		content,
+		tool_name,
+		type,
+		project,
+		topic_key,
+		tokenize='trigram',
+		content='observations',
+		content_rowid='id'
+	);
+`
 
-	if _, err := s.execHook(s.db, `
-		DROP TRIGGER IF EXISTS obs_fts_insert;
-		DROP TRIGGER IF EXISTS obs_fts_update;
-		DROP TRIGGER IF EXISTS obs_fts_delete;
-		DROP TABLE IF EXISTS observations_fts;
-		CREATE VIRTUAL TABLE observations_fts USING fts5(
-			title,
-			content,
-			tool_name,
-			type,
-			project,
-			topic_key,
-			content='observations',
-			content_rowid='id'
-		);
+const promptsFTSDefinition = `
+	CREATE VIRTUAL TABLE prompts_fts USING fts5(
+		content,
+		project,
+		tokenize='trigram',
+		content='user_prompts',
+		content_rowid='id'
+	);
+`
+
+const observationsFTSTriggers = `
+	CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations
+	WHEN new.deleted_at IS NULL BEGIN
 		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-		SELECT id, title, content, tool_name, type, project, topic_key
-		FROM observations
-		WHERE deleted_at IS NULL;
+		VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+	END;
 
-		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
-			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
-		END;
+	CREATE TRIGGER obs_fts_delete BEFORE DELETE ON observations
+	WHEN old.deleted_at IS NULL BEGIN
+		DELETE FROM observations_fts WHERE rowid = old.id;
+	END;
 
-		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
-			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
-		END;
+	CREATE TRIGGER obs_fts_update BEFORE UPDATE ON observations
+	WHEN old.deleted_at IS NULL BEGIN
+		DELETE FROM observations_fts WHERE rowid = old.id;
+	END;
 
-		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
-			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
-			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
-		END;
-	`); err != nil {
-		return fmt.Errorf("migrate fts topic_key: %w", err)
+	CREATE TRIGGER obs_fts_update_insert AFTER UPDATE ON observations
+	WHEN new.deleted_at IS NULL BEGIN
+		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+		VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+	END;
+`
+
+const promptsFTSTriggers = `
+	CREATE TRIGGER prompt_fts_insert AFTER INSERT ON user_prompts BEGIN
+		INSERT INTO prompts_fts(rowid, content, project)
+		VALUES (new.id, new.content, new.project);
+	END;
+
+	CREATE TRIGGER prompt_fts_delete BEFORE DELETE ON user_prompts BEGIN
+		DELETE FROM prompts_fts WHERE rowid = old.id;
+	END;
+
+	CREATE TRIGGER prompt_fts_update BEFORE UPDATE ON user_prompts BEGIN
+		DELETE FROM prompts_fts WHERE rowid = old.id;
+	END;
+
+	CREATE TRIGGER prompt_fts_update_insert AFTER UPDATE ON user_prompts BEGIN
+		INSERT INTO prompts_fts(rowid, content, project)
+		VALUES (new.id, new.content, new.project);
+	END;
+`
+
+// migrateFTS upgrades older FTS tables and trigger definitions together. The
+// external-content rows must be removed before their source rows change; using
+// ordinary DELETE statements in BEFORE triggers avoids the trigram tokenizer's
+// unsafe special FTS5 'delete' command on recent SQLite versions.
+func (s *Store) migrateFTS() error {
+	return s.withTx(func(tx *sql.Tx) error {
+		observationsOK, err := ftsTableMatches(tx, "observations_fts", []string{"title", "content", "tool_name", "type", "project", "topic_key"}, "observations")
+		if err != nil {
+			return fmt.Errorf("inspect observations fts: %w", err)
+		}
+		promptsOK, err := ftsTableMatches(tx, "prompts_fts", []string{"content", "project"}, "user_prompts")
+		if err != nil {
+			return fmt.Errorf("inspect prompts fts: %w", err)
+		}
+
+		observationsRebuild := !observationsOK || !ftsTriggersMatch(tx, map[string][]string{
+			"obs_fts_insert":        {"afterinsertonobservations", "whennew.deleted_atisnull"},
+			"obs_fts_delete":        {"beforedeleteonobservations", "whenold.deleted_atisnull", "deletefromobservations_ftswhererowid=old.id"},
+			"obs_fts_update":        {"beforeupdateonobservations", "whenold.deleted_atisnull", "deletefromobservations_ftswhererowid=old.id"},
+			"obs_fts_update_insert": {"afterupdateonobservations", "whennew.deleted_atisnull"},
+		})
+		promptsRebuild := !promptsOK || !ftsTriggersMatch(tx, map[string][]string{
+			"prompt_fts_insert":        {"afterinsertonuser_prompts"},
+			"prompt_fts_delete":        {"beforedeleteonuser_prompts", "deletefromprompts_ftswhererowid=old.id"},
+			"prompt_fts_update":        {"beforeupdateonuser_prompts", "deletefromprompts_ftswhererowid=old.id"},
+			"prompt_fts_update_insert": {"afterupdateonuser_prompts"},
+		})
+
+		if observationsRebuild {
+			if _, err := s.execHook(tx, `
+				DROP TRIGGER IF EXISTS obs_fts_insert;
+				DROP TRIGGER IF EXISTS obs_fts_update_insert;
+				DROP TRIGGER IF EXISTS obs_fts_update;
+				DROP TRIGGER IF EXISTS obs_fts_delete;
+				DROP TABLE IF EXISTS observations_fts;
+			`+observationsFTSDefinition+observationsFTSTriggers+`
+				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+				SELECT id, title, content, tool_name, type, project, topic_key
+				FROM observations
+				WHERE deleted_at IS NULL;
+			`); err != nil {
+				return fmt.Errorf("rebuild observations fts: %w", err)
+			}
+		}
+
+		if promptsRebuild {
+			if _, err := s.execHook(tx, `
+				DROP TRIGGER IF EXISTS prompt_fts_insert;
+				DROP TRIGGER IF EXISTS prompt_fts_update_insert;
+				DROP TRIGGER IF EXISTS prompt_fts_update;
+				DROP TRIGGER IF EXISTS prompt_fts_delete;
+				DROP TABLE IF EXISTS prompts_fts;
+			`+promptsFTSDefinition+promptsFTSTriggers+`
+				INSERT INTO prompts_fts(rowid, content, project)
+				SELECT id, content, project FROM user_prompts;
+			`); err != nil {
+				return fmt.Errorf("rebuild prompts fts: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func ftsTableMatches(tx *sql.Tx, table string, expectedColumns []string, contentTable string) (bool, error) {
+	var ddl string
+	err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&ddl)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
-	return nil
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := tx.Query(`SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0 ORDER BY cid`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if !slices.Equal(columns, expectedColumns) {
+		return false, nil
+	}
+
+	normalized := normalizeFTSSQL(ddl)
+	return strings.Contains(normalized, "createvirtualtable"+table+"usingfts5(") &&
+		strings.Contains(normalized, "tokenize='trigram'") &&
+		strings.Contains(normalized, "content='"+contentTable+"'") &&
+		strings.Contains(normalized, "content_rowid='id'"), nil
+}
+
+func ftsTriggersMatch(tx *sql.Tx, expected map[string][]string) bool {
+	for name, fragments := range expected {
+		var ddl string
+		if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`, name).Scan(&ddl); err != nil {
+			return false
+		}
+		normalized := normalizeFTSSQL(ddl)
+		for _, fragment := range fragments {
+			if !strings.Contains(normalized, fragment) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func normalizeFTSSQL(ddl string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, ddl)
 }
 
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 func (s *Store) CreateSession(id, project, directory string) error {
+	return s.CreateSessionWithOwnershipMode(id, project, directory, SessionOwnershipShared)
+}
+
+// CreateSessionWithOwnershipMode creates a session with an explicit persisted
+// ownership policy. CreateSession remains the compatibility wrapper for shared
+// runtime sessions.
+func (s *Store) CreateSessionWithOwnershipMode(id, project, directory, mode string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
+	}
+	if !validSessionOwnershipMode(mode) {
+		return fmt.Errorf("%w %q", ErrInvalidSessionOwnershipMode, mode)
 	}
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
@@ -2253,25 +2526,88 @@ func (s *Store) CreateSession(id, project, directory string) error {
 	}
 
 	return s.withTx(func(tx *sql.Tx) error {
-		if err := s.createSessionTx(tx, id, project, directory); err != nil {
+		existingProject, existingMode, found, err := sessionOwnershipTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if found {
+			if err := sessionProjectWriteError(id, existingProject, existingMode, project); err != nil {
+				return err
+			}
+		}
+		if err := s.createSessionTx(tx, id, project, directory, mode); err != nil {
 			return err
 		}
 		var persisted Session
 		// sessions.project is read through ifnull() because a database upgraded from
 		// the schema where the column was nullable still carries rows that identify no
 		// project, and no migration rewrites them.
-		if err := tx.QueryRow(`SELECT id, ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
-			&persisted.ID, &persisted.Project, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
+		if err := tx.QueryRow(`SELECT id, ifnull(project, ''), ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+			&persisted.ID, &persisted.Project, &persisted.OwnershipMode, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
 		); err != nil {
 			return err
 		}
 		return s.enqueueSyncMutationTx(tx, SyncEntitySession, persisted.ID, SyncOpUpsert, syncSessionPayload{
-			ID:        persisted.ID,
-			Project:   persisted.Project,
-			Directory: persisted.Directory,
-			StartedAt: persisted.StartedAt,
-			EndedAt:   persisted.EndedAt,
-			Summary:   persisted.Summary,
+			ID:            persisted.ID,
+			Project:       persisted.Project,
+			OwnershipMode: persisted.OwnershipMode,
+			Directory:     persisted.Directory,
+			StartedAt:     persisted.StartedAt,
+			EndedAt:       persisted.EndedAt,
+			Summary:       persisted.Summary,
+		})
+	})
+}
+
+// StartSession registers a new session or idempotently starts an active one.
+// It refuses to reuse an ended session ID so MCP callers cannot silently strand
+// later writes on a fallback session.
+func (s *Store) StartSession(id, project, directory string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	project, _ = NormalizeProject(project)
+	if strings.TrimSpace(project) == "" {
+		return ErrProjectRequired
+	}
+
+	return s.withTx(func(tx *sql.Tx) error {
+		ended, err := sessionEndedTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if ended {
+			return ErrSessionAlreadyEnded
+		}
+		existingProject, existingMode, found, err := sessionOwnershipTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if found {
+			if err := sessionProjectWriteError(id, existingProject, existingMode, project); err != nil {
+				return err
+			}
+		}
+		if err := s.startSessionTx(tx, id, project, directory, SessionOwnershipShared); err != nil {
+			return err
+		}
+		var persisted Session
+		// sessions.project is read through ifnull() because a database upgraded from
+		// the schema where the column was nullable still carries rows that identify no
+		// project, and no migration rewrites them.
+		if err := tx.QueryRow(`SELECT id, ifnull(project, ''), ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).Scan(
+			&persisted.ID, &persisted.Project, &persisted.OwnershipMode, &persisted.Directory, &persisted.StartedAt, &persisted.EndedAt, &persisted.Summary,
+		); err != nil {
+			return err
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntitySession, persisted.ID, SyncOpUpsert, syncSessionPayload{
+			ID:            persisted.ID,
+			Project:       persisted.Project,
+			OwnershipMode: persisted.OwnershipMode,
+			Directory:     persisted.Directory,
+			StartedAt:     persisted.StartedAt,
+			EndedAt:       persisted.EndedAt,
+			Summary:       persisted.Summary,
 		})
 	})
 }
@@ -2297,39 +2633,40 @@ func (s *Store) EndSession(id string, summary string) error {
 		}
 
 		var startedAt, endedAt string
-		var project, directory string
+		var project, directory, mode string
 		var storedSummary *string
 		// sessions.project is read through ifnull() because a database upgraded from
 		// the schema where the column was nullable still carries rows that identify no
 		// project, and no migration rewrites them.
 		if err := tx.QueryRow(
-			`SELECT ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
+			`SELECT ifnull(project, ''), ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
 			id,
-		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
+		).Scan(&project, &mode, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
 			return err
 		}
 
 		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
-			ID:        id,
-			Project:   project,
-			Directory: directory,
-			StartedAt: startedAt,
-			EndedAt:   &endedAt,
-			Summary:   storedSummary,
+			ID:            id,
+			Project:       project,
+			OwnershipMode: mode,
+			Directory:     directory,
+			StartedAt:     startedAt,
+			EndedAt:       &endedAt,
+			Summary:       storedSummary,
 		})
 	})
 }
 
 func (s *Store) GetSession(id string) (*Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
+		`SELECT id, project, ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
 	)
 	var sess Session
 	// A database upgraded from the schema where sessions.project was nullable
 	// still carries NULL ownership, so the column must be read as nullable or
 	// every caller that inspects a legacy session dies on an opaque scan error.
 	var project sql.NullString
-	if err := row.Scan(&sess.ID, &project, &sess.Directory, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
+	if err := row.Scan(&sess.ID, &project, &sess.OwnershipMode, &sess.Directory, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
 		return nil, err
 	}
 	sess.Project = project.String
@@ -2346,38 +2683,66 @@ func (s *Store) GetSession(id string) (*Session, error) {
 // share only the SQLite store, so the active session must be read from disk —
 // never from in-memory state.
 //
-// Selection rules:
+// Candidate rules:
 //   - Scope to the (normalized) project.
+//   - Scope to the current runtime directory.
 //   - Require ended_at IS NULL — ended sessions are never returned, so stale
 //     sessions naturally fall out without any explicit clearing step.
 //   - Exclude the manual-save fallback sessions (id LIKE 'manual-save%'); those
 //     are created by the fallback path itself and must not be resolved as "the
 //     active session", which would make resolution circular.
-//   - When multiple un-ended sessions exist, pick the MOST RECENT by
-//     started_at DESC, with id DESC as a deterministic tie-breaker.
-func (s *Store) MostRecentActiveSession(project string) (string, bool, error) {
+//
+// ActiveRuntimeSessions returns active, non-manual sessions for a project and
+// runtime directories. The directories narrow candidates; callers must not
+// treat them as session identity.
+func (s *Store) ActiveRuntimeSessions(project string, directories ...string) ([]string, error) {
 	project, _ = NormalizeProject(project)
 	if project == "" {
-		return "", false, nil
+		return nil, nil
+	}
+	directorySet := make(map[string]struct{}, len(directories))
+	for _, directory := range directories {
+		if directory != "" {
+			directorySet[directory] = struct{}{}
+		}
+	}
+	if len(directorySet) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(directorySet)+1)
+	args = append(args, project)
+	placeholders := make([]string, 0, len(directorySet))
+	for directory := range directorySet {
+		placeholders = append(placeholders, "?")
+		args = append(args, directory)
 	}
 
-	var id string
-	err := s.db.QueryRow(`
-		SELECT id
+	rows, err := s.queryHook(s.db, `
+		SELECT DISTINCT id
 		FROM sessions
 		WHERE LOWER(project) = ?
+		  AND directory IN (`+strings.Join(placeholders, ", ")+`)
 		  AND ended_at IS NULL
 		  AND id NOT LIKE 'manual-save%'
-		ORDER BY datetime(started_at) DESC, id DESC
-		LIMIT 1
-	`, project).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
+		ORDER BY id
+	`, args...)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
-	return id, true, nil
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // A database upgraded from the schema where sessions.project was nullable still
@@ -2719,7 +3084,21 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 	return s.queryObservations(query, args...)
 }
 
+// PinnedObservations returns every pinned observation for project/scope,
+// most-recent-first, with no row limit — pinning is an explicit, hand-bounded
+// action, so returning all pinned rows has always been the legacy default.
+// Callers that need a cap (e.g. FormatContextWithOptions via
+// ContextOptions.Pinned) use the unexported pinnedObservationsLimit helper,
+// which this delegates to with limit=0 ("no LIMIT clause", i.e. unbounded).
 func (s *Store) PinnedObservations(project, scope string) ([]Observation, error) {
+	return s.pinnedObservationsLimit(project, scope, 0)
+}
+
+// pinnedObservationsLimit is the shared query behind PinnedObservations. A
+// limit <= 0 means "no LIMIT clause" (every pinned row, matching
+// PinnedObservations' historical unbounded behavior); a positive limit caps
+// the result via SQL LIMIT.
+func (s *Store) pinnedObservationsLimit(project, scope string, limit int) ([]Observation, error) {
 	project, _ = NormalizeProject(project)
 
 	query := `
@@ -2739,6 +3118,10 @@ func (s *Store) PinnedObservations(project, scope string) ([]Observation, error)
 	}
 
 	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC"
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
 	return s.queryObservations(query, args...)
 }
 
@@ -3108,23 +3491,13 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		limit = 10
 	}
 
-	ftsQuery := sanitizeFTS(query)
-
-	sql := `
-		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
-		FROM prompts_fts fts
-		JOIN user_prompts p ON p.id = fts.rowid
-		WHERE prompts_fts MATCH ?
-	`
-	args := []any{ftsQuery}
-
-	if project != "" {
-		sql += " AND p.project = ?"
-		args = append(args, project)
+	var sql string
+	var args []any
+	if hasShortFTSTerm(query) {
+		sql, args = buildPromptLIKEQuery(query, project, limit)
+	} else {
+		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(query), project, limit)
 	}
-
-	sql += " ORDER BY fts.rank LIMIT ?"
-	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, sql, args...)
 	if err != nil {
@@ -3629,15 +4002,20 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		}
 	}
 
-	// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
-	var ftsQuery string
-	if opts.MatchMode == "any" {
-		ftsQuery = sanitizeFTSCandidates(query)
+	var sqlQ string
+	var args []any
+	if hasShortFTSTerm(query) {
+		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
 	} else {
-		ftsQuery = sanitizeFTS(query)
+		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+		var ftsQuery string
+		if opts.MatchMode == "any" {
+			ftsQuery = sanitizeFTSCandidates(query)
+		} else {
+			ftsQuery = sanitizeFTS(query)
+		}
+		sqlQ, args = buildSearchFTSQuery(ftsQuery, opts, limit)
 	}
-
-	sqlQ, args := buildSearchFTSQuery(ftsQuery, opts, limit)
 	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -3693,10 +4071,165 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 	return results, nil
 }
 
-func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+// SearchPreviewsContext searches using the same ranking and filters as
+// SearchContext while selecting only a bounded Unicode-safe content preview.
+func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts SearchOptions) ([]SearchPreviewResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	switch opts.MatchMode {
+	case "", "all", "any":
+	default:
+		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
+	}
+
+	opts.Project, _ = NormalizeProject(opts.Project)
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > s.cfg.MaxSearchResults {
+		limit = s.cfg.MaxSearchResults
+	}
+
+	var directResults []SearchPreviewResult
+	if strings.Contains(query, "/") {
+		tkSQL := `
+			SELECT id, ifnull(sync_id, '') as sync_id, type, title,
+			       substr(content, 1, 300) as preview, length(content) > 300 as truncated,
+			       project, scope, review_after, pinned, created_at
+			FROM observations
+			WHERE topic_key = ? AND deleted_at IS NULL
+		`
+		tkArgs := []any{query}
+		if opts.Type != "" {
+			tkSQL += " AND type = ?"
+			tkArgs = append(tkArgs, opts.Type)
+		}
+		if opts.Project != "" {
+			tkSQL += " AND LOWER(project) = ?"
+			tkArgs = append(tkArgs, opts.Project)
+		}
+		if opts.Scope != "" {
+			tkSQL += " AND scope = ?"
+			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
+		}
+		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
+		tkArgs = append(tkArgs, limit)
+
+		tkRows, err := s.db.QueryContext(ctx, tkSQL, tkArgs...)
+		if err == nil {
+			defer func() { _ = tkRows.Close() }()
+			for tkRows.Next() {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				var r SearchPreviewResult
+				if err := scanSearchPreviewRow(tkRows, &r, false); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return nil, ctxErr
+					}
+					break
+				}
+				r.Rank = -1000
+				directResults = append(directResults, r)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+	}
+
+	var sqlQ string
+	var args []any
+	if hasShortFTSTerm(query) {
+		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
+	} else {
+		ftsQuery := sanitizeFTS(query)
+		if opts.MatchMode == "any" {
+			ftsQuery = sanitizeFTSCandidates(query)
+		}
+		sqlQ, args = buildSearchPreviewFTSQuery(ftsQuery, opts, limit)
+	}
+	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("search: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	seen := make(map[int64]bool)
+	for _, r := range directResults {
+		seen[r.ID] = true
+	}
+	results := append([]SearchPreviewResult{}, directResults...)
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var r SearchPreviewResult
+		if err := scanSearchPreviewRow(rows, &r, true); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, err
+		}
+		if !seen[r.ID] {
+			results = append(results, r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
+func buildSearchPromptsFTSQuery(ftsQuery, project string, limit int) (string, []any) {
 	sqlQ := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
+		FROM prompts_fts fts
+		CROSS JOIN user_prompts p ON p.id = fts.rowid
+		WHERE prompts_fts MATCH ?
+	`
+	args := []any{ftsQuery}
+
+	if project != "" {
+		sqlQ += " AND p.project = ?"
+		args = append(args, project)
+	}
+
+	sqlQ += " ORDER BY fts.rank LIMIT ?"
+	return sqlQ, append(args, limit)
+}
+
+func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at`, ftsQuery, opts, limit)
+}
+
+func buildSearchPreviewFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.type, o.title,
+	       substr(o.content, 1, 300) as preview, length(o.content) > 300 as truncated,
+	       o.project, o.scope, o.review_after, o.pinned, o.created_at`, ftsQuery, opts, limit)
+}
+
+func buildSearchFTSQueryWithColumns(columns, ftsQuery string, opts SearchOptions, limit int) (string, []any) {
+	sqlQ := `
+		SELECT ` + columns + `,
 		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
 		FROM observations_fts fts
 		CROSS JOIN observations o ON o.id = fts.rowid
@@ -3718,6 +4251,104 @@ func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string
 	}
 
 	sqlQ += " ORDER BY rank LIMIT ?"
+	return sqlQ, append(args, limit)
+}
+
+// hasShortFTSTerm identifies the only queries trigram FTS5 cannot satisfy.
+// Those terms use a bounded, escaped base-table fallback instead of changing
+// normal FTS ranking or treating every search as a LIKE scan.
+func hasShortFTSTerm(query string) bool {
+	for _, term := range searchTerms(query) {
+		if utf8.RuneCountInString(term) < 3 {
+			return true
+		}
+	}
+	return false
+}
+
+func searchTerms(query string) []string {
+	var terms []string
+	for _, term := range strings.Fields(query) {
+		term = strings.Trim(term, `"`)
+		if term != "" {
+			terms = append(terms, term)
+		}
+	}
+	return terms
+}
+
+func escapeLIKE(term string) string {
+	term = strings.ReplaceAll(term, `\`, `\\`)
+	term = strings.ReplaceAll(term, `%`, `\%`)
+	return strings.ReplaceAll(term, `_`, `\_`)
+}
+
+func buildSearchLIKEQuery(query string, opts SearchOptions, limit int) (string, []any) {
+	return buildSearchLIKEQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at`, query, opts, limit)
+}
+
+func buildSearchPreviewLIKEQuery(query string, opts SearchOptions, limit int) (string, []any) {
+	return buildSearchLIKEQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.type, o.title,
+	       substr(o.content, 1, 300) as preview, length(o.content) > 300 as truncated,
+	       o.project, o.scope, o.review_after, o.pinned, o.created_at`, query, opts, limit)
+}
+
+func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, limit int) (string, []any) {
+	sqlQ := `
+		SELECT ` + columns + `,
+		       0.0 AS rank
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+	`
+	args := []any{}
+	termGroups := make([]string, 0)
+	for _, term := range searchTerms(query) {
+		termGroups = append(termGroups, `(o.title LIKE ? ESCAPE '\' OR o.content LIKE ? ESCAPE '\' OR o.tool_name LIKE ? ESCAPE '\' OR o.type LIKE ? ESCAPE '\' OR o.project LIKE ? ESCAPE '\' OR o.topic_key LIKE ? ESCAPE '\')`)
+		pattern := "%" + escapeLIKE(term) + "%"
+		for range 6 {
+			args = append(args, pattern)
+		}
+	}
+	joiner := " AND "
+	if opts.MatchMode == "any" {
+		joiner = " OR "
+	}
+	sqlQ += " AND (" + strings.Join(termGroups, joiner) + ")"
+	if opts.Type != "" {
+		sqlQ += " AND o.type = ?"
+		args = append(args, opts.Type)
+	}
+	if opts.Project != "" {
+		sqlQ += " AND LOWER(o.project) = ?"
+		args = append(args, opts.Project)
+	}
+	if opts.Scope != "" {
+		sqlQ += " AND o.scope = ?"
+		args = append(args, normalizeScope(opts.Scope))
+	}
+	sqlQ += " ORDER BY datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
+	return sqlQ, append(args, limit)
+}
+
+func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
+	sqlQ := `
+		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
+		FROM user_prompts p
+		WHERE `
+	args := []any{}
+	termGroups := make([]string, 0)
+	for _, term := range searchTerms(query) {
+		termGroups = append(termGroups, `(p.content LIKE ? ESCAPE '\' OR p.project LIKE ? ESCAPE '\')`)
+		pattern := "%" + escapeLIKE(term) + "%"
+		args = append(args, pattern, pattern)
+	}
+	sqlQ += "(" + strings.Join(termGroups, " AND ") + ")"
+	if project != "" {
+		sqlQ += " AND p.project = ?"
+		args = append(args, project)
+	}
+	sqlQ += " ORDER BY p.created_at DESC, p.id DESC LIMIT ?"
 	return sqlQ, append(args, limit)
 }
 
@@ -3745,14 +4376,20 @@ func (s *Store) statsForProject(project string) (*Stats, error) {
 		where = " WHERE LOWER(project) = ?"
 		args = append(args, project)
 	}
-	s.db.QueryRow("SELECT COUNT(*) FROM sessions"+where, args...).Scan(&stats.TotalSessions)
-	s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+func() string {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM sessions"+where, args...).Scan(&stats.TotalSessions); errors.Is(err, ErrDatabaseGenerationChanged) {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+func() string {
 		if project == "" {
 			return ""
 		}
 		return " AND LOWER(project) = ?"
-	}(), args...).Scan(&stats.TotalObservations)
-	s.db.QueryRow("SELECT COUNT(*) FROM user_prompts"+where, args...).Scan(&stats.TotalPrompts)
+	}(), args...).Scan(&stats.TotalObservations); errors.Is(err, ErrDatabaseGenerationChanged) {
+		return nil, err
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts"+where, args...).Scan(&stats.TotalPrompts); errors.Is(err, ErrDatabaseGenerationChanged) {
+		return nil, err
+	}
 
 	projectsQuery := "SELECT project FROM observations WHERE project IS NOT NULL AND deleted_at IS NULL"
 	if project != "" {
@@ -3761,14 +4398,33 @@ func (s *Store) statsForProject(project string) (*Stats, error) {
 	projectsQuery += " GROUP BY project ORDER BY MAX(created_at) DESC"
 	rows, err := s.queryItHook(s.db, projectsQuery, args...)
 	if err != nil {
+		if errors.Is(err, ErrDatabaseGenerationChanged) {
+			return nil, err
+		}
 		return stats, nil
 	}
-	defer rows.Close()
 
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err == nil {
-			stats.Projects = append(stats.Projects, p)
+		var projectName string
+		if err := rows.Scan(&projectName); err != nil {
+			_ = rows.Close()
+			if errors.Is(err, ErrDatabaseGenerationChanged) {
+				return nil, err
+			}
+			return stats, nil
+		}
+		stats.Projects = append(stats.Projects, projectName)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		if errors.Is(err, ErrDatabaseGenerationChanged) {
+			return nil, err
+		}
+		return stats, nil
+	}
+	if err := rows.Close(); err != nil {
+		if errors.Is(err, ErrDatabaseGenerationChanged) {
+			return nil, err
 		}
 	}
 
@@ -3810,25 +4466,100 @@ SELECT 1 FROM (
 
 // ─── Context Formatting ─────────────────────────────────────────────────────
 
+// ContextOptions tunes FormatContextWithOptions, capping how many rows each
+// section of the "## Memory from Previous Sessions" block renders.
+//
+// Every field follows the same convention:
+//   - 0  uses that section's legacy default.
+//   - >0 caps the section at that many rows.
+//   - <0 omits the section entirely, including its "### ..." header.
+//
+// The legacy defaults are Sessions 5, Prompts 10, Observations
+// s.cfg.MaxContextResults, and Pinned unlimited (no SQL LIMIT) — exactly
+// what FormatContext has always produced, so a zero-value ContextOptions{}
+// reproduces FormatContext's output byte-for-byte. See issue #163
+// (bounded-size injection).
+type ContextOptions struct {
+	// MaxBytes caps the complete rendered context in bytes. Zero preserves the
+	// unbounded legacy output; a positive value returns at most that many bytes.
+	MaxBytes int
+
+	// Observations caps the "### Recent Observations" section (unpinned).
+	Observations int
+
+	// Prompts caps the "### Recent User Prompts" section.
+	Prompts int
+
+	// Sessions caps the "### Recent Sessions" section.
+	Sessions int
+
+	// Pinned caps the "### Pinned" section.
+	Pinned int
+
+	// Compact drops the inline content preview from observation-shaped
+	// bullets — both "### Pinned" and "### Recent Observations" render
+	// `- [type] **title**` instead of `- [type] **title**: <300 chars of
+	// body>`. Sessions and prompts bullets are unaffected.
+	Compact bool
+}
+
+// FormatContext is a thin wrapper around FormatContextWithOptions using a
+// zero-value ContextOptions, preserving the pre-ContextOptions call
+// signature so existing callers and tests keep working unchanged.
 func (s *Store) FormatContext(project, scope string) (string, error) {
-	sessions, err := s.RecentSessions(project, 5)
-	if err != nil {
-		return "", err
+	return s.FormatContextWithOptions(project, scope, ContextOptions{})
+}
+
+// FormatContextWithOptions renders the "## Memory from Previous Sessions"
+// markdown block for the given project/scope, honoring the per-section caps
+// and Compact rendering in opts. See ContextOptions for the cap convention.
+func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOptions) (string, error) {
+	var (
+		sessions     []SessionSummary
+		pinned       []Observation
+		observations []Observation
+		prompts      []Prompt
+		err          error
+	)
+
+	if opts.Sessions >= 0 {
+		limit := opts.Sessions
+		if limit == 0 {
+			limit = 5
+		}
+		if sessions, err = s.RecentSessions(project, limit); err != nil {
+			return "", err
+		}
 	}
 
-	pinned, err := s.PinnedObservations(project, scope)
-	if err != nil {
-		return "", err
+	if opts.Pinned == 0 {
+		if pinned, err = s.PinnedObservations(project, scope); err != nil {
+			return "", err
+		}
+	} else if opts.Pinned > 0 {
+		if pinned, err = s.pinnedObservationsLimit(project, scope, opts.Pinned); err != nil {
+			return "", err
+		}
 	}
 
-	observations, err := s.recentUnpinnedObservations(project, scope, s.cfg.MaxContextResults)
-	if err != nil {
-		return "", err
+	if opts.Observations >= 0 {
+		limit := opts.Observations
+		if limit == 0 {
+			limit = s.cfg.MaxContextResults
+		}
+		if observations, err = s.recentUnpinnedObservations(project, scope, limit); err != nil {
+			return "", err
+		}
 	}
 
-	prompts, err := s.RecentPrompts(project, 10)
-	if err != nil {
-		return "", err
+	if opts.Prompts >= 0 {
+		limit := opts.Prompts
+		if limit == 0 {
+			limit = 10
+		}
+		if prompts, err = s.RecentPrompts(project, limit); err != nil {
+			return "", err
+		}
 	}
 
 	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 {
@@ -3862,8 +4593,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(pinned) > 0 {
 		b.WriteString("### Pinned\n")
 		for _, obs := range pinned {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			writeObservationBullet(&b, obs, opts.Compact)
 		}
 		b.WriteString("\n")
 	}
@@ -3871,13 +4601,40 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
+			writeObservationBullet(&b, obs, opts.Compact)
 		}
 		b.WriteString("\n")
 	}
 
-	return b.String(), nil
+	return limitContextBytes(b.String(), opts.MaxBytes), nil
+}
+
+const contextTruncationMarker = "\n[truncated]\n"
+
+// limitContextBytes caps rendered context without splitting a UTF-8 sequence.
+// When the marker fits, it replaces the final part of the context to make the
+// omission explicit while keeping the result within maxBytes.
+func limitContextBytes(context string, maxBytes int) string {
+	if maxBytes <= 0 || len(context) <= maxBytes {
+		return context
+	}
+	if maxBytes < len(contextTruncationMarker) {
+		return truncateUTF8Prefix(context, maxBytes)
+	}
+	return truncateUTF8Prefix(context, maxBytes-len(contextTruncationMarker)) + contextTruncationMarker
+}
+
+func truncateUTF8Prefix(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if maxBytes >= len(s) {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }
 
 // FormatCompactionContext returns runtime context that is strictly limited to
@@ -3941,10 +4698,44 @@ func (s *Store) FormatCompactionContext(sessionID string) (string, error) {
 	return b.String(), nil
 }
 
+// writeObservationBullet renders one observation-shaped bullet shared by the
+// "### Pinned" and "### Recent Observations" loops in FormatContextWithOptions,
+// so both sections stay byte-for-byte in sync — a future formatting change
+// (truncate length, redaction) now only has one place to land instead of two
+// copies that can drift apart. When compact is true it drops the inline
+// content preview; otherwise it appends up to 300 chars of obs.Content.
+func writeObservationBullet(b *strings.Builder, obs Observation, compact bool) {
+	if compact {
+		fmt.Fprintf(b, "- [%s] **%s**\n", obs.Type, obs.Title)
+	} else {
+		fmt.Fprintf(b, "- [%s] **%s**: %s\n",
+			obs.Type, obs.Title, truncate(obs.Content, 300))
+	}
+}
+
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *Store) Export() (*ExportData, error) {
 	return s.exportWithProjectScope("")
+}
+
+// HasProjectOwnedSessions reports whether any session requires ownership-mode sync.
+func (s *Store) HasProjectOwnedSessions() (bool, error) {
+	var found int
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sessions WHERE ownership_mode = ?)`, SessionOwnershipProjectOwned).Scan(&found)
+	return found != 0, err
+}
+
+// HasProjectOwnedSessionsForProject reports whether project requires ownership-mode sync.
+func (s *Store) HasProjectOwnedSessionsForProject(project string) (bool, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return s.HasProjectOwnedSessions()
+	}
+	var found int
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sessions WHERE project = ? AND ownership_mode = ?)`, project, SessionOwnershipProjectOwned).Scan(&found)
+	return found != 0, err
 }
 
 // ExportProject returns an export restricted to records relevant to a single
@@ -4027,7 +4818,7 @@ func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 		ExportedAt: Now(),
 	}
 
-	sessionQuery := "SELECT id, ifnull(project, ''), directory, started_at, ended_at, summary FROM sessions"
+	sessionQuery := "SELECT id, ifnull(project, ''), directory, ifnull(ownership_mode, ''), started_at, ended_at, summary FROM sessions"
 	sessionArgs := []any{}
 	if project != "" {
 		sessionQuery += `
@@ -4056,7 +4847,7 @@ func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var sess Session
-		if err := rows.Scan(&sess.ID, &sess.Project, &sess.Directory, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Project, &sess.Directory, &sess.OwnershipMode, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
 			return nil, err
 		}
 		data.Sessions = append(data.Sessions, sess)
@@ -4126,6 +4917,9 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if err := validateSessionID(sess.ID); err != nil {
 			return nil, fmt.Errorf("import session: %w", err)
 		}
+		if strings.TrimSpace(sess.OwnershipMode) != "" && !validSessionOwnershipMode(sess.OwnershipMode) {
+			return nil, fmt.Errorf("import session %s: %w %q", sess.ID, ErrInvalidSessionOwnershipMode, sess.OwnershipMode)
+		}
 	}
 	tx, err := s.beginTxHook()
 	if err != nil {
@@ -4138,9 +4932,9 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	// Import sessions (skip duplicates)
 	for _, sess := range data.Sessions {
 		res, err := s.execHook(tx,
-			`INSERT OR IGNORE INTO sessions (id, project, directory, started_at, ended_at, summary)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			sess.ID, sess.Project, sess.Directory, sess.StartedAt, sess.EndedAt, sess.Summary,
+			`INSERT OR IGNORE INTO sessions (id, project, ownership_mode, directory, started_at, ended_at, summary)
+			 VALUES (?, ?, COALESCE(?, 'shared'), ?, ?, ?, ?)`,
+			sess.ID, sess.Project, nullableOwnershipMode(sess.OwnershipMode), sess.Directory, sess.StartedAt, sess.EndedAt, sess.Summary,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import session %s: %w", sess.ID, err)
@@ -4152,6 +4946,39 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	// Import observations (use new IDs — AUTOINCREMENT, skip duplicate sync IDs)
 	for _, obs := range data.Observations {
 		syncID := normalizeExistingSyncID(obs.SyncID, "obs")
+		existing, lookupErr := s.getObservationBySyncIDTx(tx, syncID, true)
+		if lookupErr != nil && lookupErr != sql.ErrNoRows {
+			return nil, fmt.Errorf("import observation %d: %w", obs.ID, lookupErr)
+		}
+		if lookupErr == nil {
+			// Import snapshots use timestamp ordering. A missing timestamp cannot
+			// prove that the incoming snapshot is newer, so leave the local row
+			// untouched in that case as well.
+			incoming := normalizeComparableTimestamp(obs.UpdatedAt)
+			current := normalizeComparableTimestamp(existing.UpdatedAt)
+			if incoming == "" || current == "" || incoming <= current {
+				result.ObservationsSkippedStale++
+				continue
+			}
+			createdAt := obs.CreatedAt
+			if normalizeComparableTimestamp(createdAt) == "" {
+				createdAt = existing.CreatedAt
+			}
+			revisionCount := obs.RevisionCount
+			if revisionCount <= 0 {
+				revisionCount = existing.RevisionCount
+			}
+			duplicateCount := obs.DuplicateCount
+			if duplicateCount <= 0 {
+				duplicateCount = existing.DuplicateCount
+			}
+			if _, err := s.execHook(tx, `UPDATE observations SET session_id = ?, type = ?, title = ?, content = ?, tool_name = CAST(? AS TEXT), project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, created_at = ?, updated_at = ?, deleted_at = ? WHERE id = ?`,
+				obs.SessionID, obs.Type, obs.Title, obs.Content, obs.ToolName, obs.Project, normalizeScope(obs.Scope), nullableString(normalizeTopicKey(derefString(obs.TopicKey))), hashNormalized(obs.Content), revisionCount, duplicateCount, obs.LastSeenAt, obs.ReviewAfter, createdAt, obs.UpdatedAt, obs.DeletedAt, existing.ID); err != nil {
+				return nil, fmt.Errorf("import observation %d: %w", obs.ID, err)
+			}
+			result.ObservationsUpdated++
+			continue
+		}
 		res, err := s.execHook(tx,
 			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
 			 SELECT ?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -4184,15 +5011,28 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 
 	// Import prompts
 	for _, p := range data.Prompts {
-		_, err := s.execHook(tx,
+		syncID := normalizeExistingSyncID(p.SyncID, "prompt")
+		var tombstoneDeletedAt string
+		if err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&tombstoneDeletedAt); err == nil {
+			if isStalePromptUpsert(syncPromptPayload{CreatedAt: p.CreatedAt}, tombstoneDeletedAt) {
+				continue
+			}
+			if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
+				return nil, fmt.Errorf("import prompt %d: remove tombstone: %w", p.ID, err)
+			}
+		} else if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
+		}
+		res, err := s.execHook(tx,
 			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at)
-			 VALUES (?, ?, ?, ?, ?)`,
-			normalizeExistingSyncID(p.SyncID, "prompt"), p.SessionID, p.Content, p.Project, p.CreatedAt,
+			 SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ?)`,
+			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, syncID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
 		}
-		result.PromptsImported++
+		n, _ := res.RowsAffected()
+		result.PromptsImported += int(n)
 	}
 
 	if err := s.commitHook(tx); err != nil {
@@ -4203,9 +5043,11 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 }
 
 type ImportResult struct {
-	SessionsImported     int `json:"sessions_imported"`
-	ObservationsImported int `json:"observations_imported"`
-	PromptsImported      int `json:"prompts_imported"`
+	SessionsImported         int `json:"sessions_imported"`
+	ObservationsImported     int `json:"observations_imported"`
+	ObservationsUpdated      int `json:"observations_updated"`
+	ObservationsSkippedStale int `json:"observations_skipped_stale"`
+	PromptsImported          int `json:"prompts_imported"`
 }
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
@@ -4291,6 +5133,48 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	return mutations, rows.Err()
 }
 
+// CloudSyncSummary returns status across project-scoped cloud targets only.
+// It deliberately excludes the legacy global cloud target because explicit cloud
+// sync records state under cloud:<project>.
+func (s *Store) CloudSyncSummary() (CloudSyncSummary, error) {
+	const cloudProjectTarget = "cloud:%"
+	var summary CloudSyncSummary
+	var lastSuccess, lastError, reasonCode sql.NullString
+	err := s.db.QueryRow(`
+		WITH latest_error AS (
+			SELECT last_error, reason_code
+			FROM sync_state
+			WHERE target_key LIKE ? AND last_error IS NOT NULL
+			ORDER BY updated_at DESC, target_key ASC
+			LIMIT 1
+		)
+		SELECT MAX(sync_state.last_success_at), latest_error.last_error, latest_error.reason_code
+		FROM sync_state
+		LEFT JOIN latest_error ON TRUE
+		WHERE sync_state.target_key LIKE ?`, cloudProjectTarget, cloudProjectTarget).Scan(&lastSuccess, &lastError, &reasonCode)
+	if err != nil {
+		return CloudSyncSummary{}, err
+	}
+	if lastSuccess.Valid {
+		summary.LastSuccessAt = lastSuccess.String
+	}
+	if lastError.Valid {
+		summary.LastError = lastError.String
+	}
+	if reasonCode.Valid {
+		summary.ReasonCode = reasonCode.String
+	}
+	err = s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM sync_mutations sm
+		JOIN sync_enrolled_projects sep ON sm.project = sep.project
+		WHERE sm.target_key LIKE ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'`, cloudProjectTarget).Scan(&summary.PendingMutations)
+	if err != nil {
+		return CloudSyncSummary{}, err
+	}
+	return summary, nil
+}
+
 func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]SyncMutation, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if limit <= 0 {
@@ -4324,7 +5208,8 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 // QuarantineIrreparableSyncMutations explicitly disposes of pending mutations
 // the existing legacy validator proves cannot be repaired from local state.
 // It never acknowledges, rewrites, or deletes a mutation.
-func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (SyncMutationQuarantineReport, error) {
+func (s *Store) QuarantineIrreparableSyncMutations(targetKey, project string, apply bool) (SyncMutationQuarantineReport, error) {
+	targetKey = normalizeSyncTargetKey(targetKey)
 	project, _ = NormalizeProject(project)
 	project = strings.TrimSpace(project)
 	report := SyncMutationQuarantineReport{Project: project, Applied: apply, Actions: []SyncMutationQuarantineAction{}}
@@ -4333,7 +5218,7 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 		quarantinedAny := false
 		query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 			FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`
-		args := []any{DefaultSyncTargetKey}
+		args := []any{targetKey}
 		if project != "" {
 			query += ` AND project = ?`
 			args = append(args, project)
@@ -4365,7 +5250,7 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 			if !apply {
 				continue
 			}
-			result, err := s.execHook(tx, `UPDATE sync_mutations SET disposition = 'quarantined', disposition_reason = ?, disposition_evidence = ?, disposition_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`, action.ReasonCode, action.Evidence, DefaultSyncTargetKey, action.Seq)
+			result, err := s.execHook(tx, `UPDATE sync_mutations SET disposition = 'quarantined', disposition_reason = ?, disposition_evidence = ?, disposition_at = datetime('now') WHERE target_key = ? AND seq = ? AND acked_at IS NULL AND disposition = 'pending'`, action.ReasonCode, action.Evidence, targetKey, action.Seq)
 			if err != nil {
 				return err
 			}
@@ -4391,12 +5276,14 @@ func (s *Store) QuarantineIrreparableSyncMutations(project string, apply bool) (
 		if !apply || !quarantinedAny {
 			return nil
 		}
-		if err := s.refreshSyncLifecycleTx(tx, DefaultSyncTargetKey); err != nil {
+		if err := s.refreshSyncLifecycleTx(tx, targetKey); err != nil {
 			return err
 		}
-		for affectedProject := range affectedProjects {
-			if err := s.refreshProjectSyncLifecycleTx(tx, affectedProject); err != nil {
-				return err
+		if targetKey == DefaultSyncTargetKey {
+			for affectedProject := range affectedProjects {
+				if err := s.refreshProjectSyncLifecycleTx(tx, affectedProject); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -4871,7 +5758,16 @@ func (s *Store) MarkSyncAuthRequired(targetKey, message string) error {
 }
 
 func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
+	return s.MarkSyncFailureWithReason(targetKey, "transport_failed", message, backoffUntil)
+}
+
+// MarkSyncFailureWithReason records a degraded failure while preserving its reason code.
+func (s *Store) MarkSyncFailureWithReason(targetKey, reasonCode, message string, backoffUntil time.Time) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
+	reasonCode = strings.TrimSpace(reasonCode)
+	if reasonCode == "" {
+		reasonCode = "transport_failed"
+	}
 	backoff := backoffUntil.UTC().Format(time.RFC3339)
 	return s.withTx(func(tx *sql.Tx) error {
 		state, err := s.getSyncStateTx(tx, targetKey)
@@ -4882,7 +5778,7 @@ func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Tim
 			`UPDATE sync_state
 			 SET lifecycle = ?, consecutive_failures = ?, backoff_until = ?, reason_code = ?, reason_message = ?, last_error = ?, updated_at = datetime('now')
 			 WHERE target_key = ?`,
-			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, "transport_failed", message, message, targetKey,
+			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, reasonCode, message, message, targetKey,
 		)
 		return err
 	})
@@ -4896,7 +5792,7 @@ func (s *Store) MarkSyncHealthy(targetKey string) error {
 		}
 		_, err := s.execHook(tx,
 			`UPDATE sync_state
-			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, last_success_at = datetime('now'), updated_at = datetime('now')
 			 WHERE target_key = ?`,
 			SyncLifecycleHealthy, targetKey,
 		)
@@ -5185,6 +6081,54 @@ func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 
 // ─── Project Enrollment for Cloud Sync ───────────────────────────────────────
 
+var newRemirrorSource = func() string {
+	return fmt.Sprintf("remirror:%d", time.Now().UTC().UnixNano())
+}
+
+// RemirrorProject enqueues a fresh current-state replay for an enrolled project.
+// It leaves historical delivery rows untouched so recovery remains auditable.
+func (s *Store) RemirrorProject(project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return fmt.Errorf("cloud remirror requires project")
+	}
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return fmt.Errorf("cloud remirror enrollment check: %w", err)
+	}
+	if !enrolled {
+		return fmt.Errorf("cloud remirror requires enrolled project %q", project)
+	}
+	return s.withTx(func(tx *sql.Tx) error {
+		source, err := s.nextRemirrorSourceTx(tx)
+		if err != nil {
+			return err
+		}
+		return s.backfillProjectSyncMutationsTx(tx, project, source)
+	})
+}
+
+func (s *Store) nextRemirrorSourceTx(tx *sql.Tx) (string, error) {
+	base := strings.TrimSpace(newRemirrorSource())
+	if base == "" {
+		return "", fmt.Errorf("cloud remirror source is required")
+	}
+	for suffix := 0; ; suffix++ {
+		source := base
+		if suffix > 0 {
+			source = fmt.Sprintf("%s:%d", base, suffix)
+		}
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM sync_mutations WHERE source = ?)`, source).Scan(&exists); err != nil {
+			return "", err
+		}
+		if !exists {
+			return source, nil
+		}
+	}
+}
+
 // EnrollProject registers a project for cloud sync. Idempotent — re-enrolling
 // an already-enrolled project is a no-op.
 func (s *Store) EnrollProject(project string) error {
@@ -5276,7 +6220,7 @@ type MigrateResult struct {
 }
 
 // ProjectRescueParams identifies historical rows whose missing project ownership
-// was explicitly confirmed by an operator. Only rows with a NULL project qualify.
+// or blank same-project ownership mode was explicitly confirmed by an operator.
 type ProjectRescueParams struct {
 	TargetProject  string
 	ObservationIDs []int64
@@ -5397,6 +6341,25 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 			}
 			result.RescuedSessions++
 		}
+		for _, sessionID := range scope.ordered {
+			if !plan.stampOwnershipMode[sessionID] {
+				continue
+			}
+			res, err := s.execHook(tx, rescueSessionQuery.updateOwnershipMode,
+				target, target, SessionOwnershipProjectOwned, SessionOwnershipShared, sessionID, sqlWhitespaceTrimSet,
+			)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n != 1 {
+				return fmt.Errorf("stamp ownership mode for session %q: updated %d rows, want 1", sessionID, n)
+			}
+			result.RescuedSessions++
+		}
 		for _, query := range []struct {
 			query rescueRecordQuery
 			moves []int64
@@ -5413,7 +6376,7 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 			}
 		}
 
-		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, scope.ordered, p)
+		journaled, err := s.enqueueRescuedProjectMutationsTx(tx, target, scope.ordered, plan.stampOwnershipMode, p)
 		if err != nil {
 			return err
 		}
@@ -5432,6 +6395,9 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 type rescuePlan struct {
 	// claim lists unowned sessions that will be moved to the target.
 	claim []string
+	// stampOwnershipMode identifies target-owned sessions whose blank ownership
+	// mode can be deterministically classified from their session ID.
+	stampOwnershipMode map[string]bool
 	// willOwn reports, for every session in scope, whether it belongs to the
 	// target once the plan is applied.
 	willOwn map[string]bool
@@ -5441,9 +6407,12 @@ type rescuePlan struct {
 // unowned session that already parents a record owned by another project stays
 // put: claiming it would split that record from its session.
 func planRescueSessionsTx(tx *sql.Tx, scope rescueSessionScope, target string, result *ProjectRescueResult) (rescuePlan, error) {
-	plan := rescuePlan{willOwn: make(map[string]bool, len(scope.ordered))}
+	plan := rescuePlan{
+		stampOwnershipMode: make(map[string]bool),
+		willOwn:            make(map[string]bool, len(scope.ordered)),
+	}
 	for _, sessionID := range scope.ordered {
-		project, found, err := sessionOwnershipTx(tx, sessionID)
+		project, mode, found, err := sessionOwnershipTx(tx, sessionID)
 		if err != nil {
 			return plan, err
 		}
@@ -5455,7 +6424,9 @@ func planRescueSessionsTx(tx *sql.Tx, scope rescueSessionScope, target string, r
 			}
 		case project == target:
 			plan.willOwn[sessionID] = true
-			if scope.explicit[sessionID] {
+			if mode == "" {
+				plan.stampOwnershipMode[sessionID] = true
+			} else if scope.explicit[sessionID] {
 				result.countOutcome(rescueAlreadyOwned)
 			}
 		case project != "":
@@ -5540,9 +6511,10 @@ func (r *ProjectRescueResult) countOutcome(outcome rescueOutcome) {
 type rescueRecordQuery struct {
 	// selectSessionID reads the parent session id of one record. It is empty for
 	// sessions, which have no parent.
-	selectSessionID string
-	selectProject   string
-	updateProject   string
+	selectSessionID     string
+	selectProject       string
+	updateProject       string
+	updateOwnershipMode string
 }
 
 var (
@@ -5557,8 +6529,9 @@ var (
 		updateProject:   `UPDATE user_prompts SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
 	}
 	rescueSessionQuery = rescueRecordQuery{
-		selectProject: `SELECT project FROM sessions WHERE id = ?`,
-		updateProject: `UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
+		selectProject:       `SELECT project FROM sessions WHERE id = ?`,
+		updateProject:       `UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
+		updateOwnershipMode: `UPDATE sessions SET project = ?, ownership_mode = CASE WHEN id = 'manual-save-' || ? THEN ? ELSE ? END WHERE id = ? AND ifnull(trim(ownership_mode, ?), '') = ''`,
 	}
 )
 
@@ -5714,6 +6687,46 @@ func (s *Store) ListProjectNames() ([]string, error) {
 		results = append(results, name)
 	}
 	return results, rows.Err()
+}
+
+// ListProjectsForCloudEnrollment returns every local identity that can be
+// enrolled, normalized and ordered deterministically for the cloud TUI.
+func (s *Store) ListProjectsForCloudEnrollment() ([]string, error) {
+	rows, err := s.queryItHook(s.db, `SELECT project FROM (
+		SELECT project FROM observations WHERE deleted_at IS NULL
+		UNION
+		SELECT project FROM sessions
+		UNION
+		SELECT project FROM user_prompts
+		UNION
+		SELECT project FROM sync_enrolled_projects
+	) WHERE project IS NOT NULL AND TRIM(project) != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	projects := make(map[string]struct{})
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return nil, err
+		}
+		project, _ = NormalizeProject(project)
+		if strings.TrimSpace(project) != "" {
+			projects[project] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	results := make([]string, 0, len(projects))
+	for project := range projects {
+		results = append(results, project)
+	}
+	sort.Strings(results)
+	return results, nil
 }
 
 // ProjectStats holds aggregate statistics for a single project.
@@ -6189,9 +7202,13 @@ func (s *Store) DeleteProject(project string, hardDelete bool) (*DeleteProjectRe
 
 		// 3. Delete sessions — only when hard-deleting, because observation rows
 		//    reference sessions via a NOT NULL FK and soft-deleted rows are still
-		//    present in the table.
+		//    present in the table. Keep sessions referenced by either table, even
+		//    when the remaining rows belong to another project.
 		if hardDelete {
-			res, err = s.execHook(tx, `DELETE FROM sessions WHERE project = ?`, project)
+			res, err = s.execHook(tx, `DELETE FROM sessions
+				WHERE project = ?
+				  AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.session_id = sessions.id)
+				  AND NOT EXISTS (SELECT 1 FROM user_prompts WHERE user_prompts.session_id = sessions.id)`, project)
 			if err != nil {
 				return fmt.Errorf("delete project: delete sessions: %w", err)
 			}
@@ -6251,18 +7268,53 @@ func isRetryableSQLiteLockError(err error) bool {
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy") || strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "sqlite_locked")
 }
 
-func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory string) error {
+func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
+		`INSERT INTO sessions (id, project, ownership_mode, directory) VALUES (?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
-		   project   = CASE WHEN sessions.project = '' THEN excluded.project ELSE sessions.project END,
+		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
+		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
 		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END`,
-		id, project, directory,
+		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	return err
+}
+
+func (s *Store) startSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
+	result, err := s.execHook(tx,
+		`INSERT INTO sessions (id, project, ownership_mode, directory) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
+		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
+		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END
+		 WHERE sessions.ended_at IS NULL`,
+		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrSessionAlreadyEnded
+	}
+	return nil
+}
+
+func validSessionOwnershipMode(mode string) bool {
+	return mode == SessionOwnershipShared || mode == SessionOwnershipProjectOwned
+}
+
+func nullableOwnershipMode(mode string) any {
+	if validSessionOwnershipMode(mode) {
+		return mode
+	}
+	return nil
 }
 
 func (s *Store) ensureSyncState(targetKey string) error {
@@ -6276,10 +7328,10 @@ func (s *Store) ensureSyncState(targetKey string) error {
 func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
 	row := s.db.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, last_success_at, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.LastSuccessAt, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -6294,42 +7346,60 @@ func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error)
 	}
 	row := tx.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, last_success_at, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.LastSuccessAt, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
 }
 
-func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error {
-	if err := s.backfillSessionSyncMutationsTx(tx, project); err != nil {
+func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string, source ...string) error {
+	if err := s.backfillSessionSyncMutationsTx(tx, project, source...); err != nil {
 		return err
 	}
-	if err := s.backfillObservationSyncMutationsTx(tx, project); err != nil {
+	if err := s.backfillObservationSyncMutationsTx(tx, project, source...); err != nil {
 		return err
 	}
-	if err := s.backfillPromptSyncMutationsTx(tx, project); err != nil {
+	if err := s.backfillPromptSyncMutationsTx(tx, project, source...); err != nil {
 		return err
 	}
-	return s.backfillRelationSyncMutationsTx(tx, project)
+	return s.backfillRelationSyncMutationsTx(tx, project, source...)
+}
+
+func backfillMutationSource(source []string) string {
+	if len(source) == 0 || strings.TrimSpace(source[0]) == "" {
+		return SyncSourceLocal
+	}
+	return strings.TrimSpace(source[0])
 }
 
 // enqueueRescuedProjectMutationsTx journals the rescued rows. sessionIDs covers
 // the explicitly requested sessions plus every dependent parent session, so a
 // rescued observation is never pushed ahead of the session that now owns it.
-func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sessionIDs []string, p ProjectRescueParams) (bool, error) {
+func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sessionIDs []string, modeStamped map[string]bool, p ProjectRescueParams) (bool, error) {
 	journaled := false
 	for _, id := range sessionIDs {
 		var payload syncSessionPayload
-		err := tx.QueryRow(`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ? AND project = ?`, id, target).
-			Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
+		err := tx.QueryRow(`SELECT id, ifnull(project, ''), ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id).
+			Scan(&payload.ID, &payload.Project, &payload.OwnershipMode, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return false, err
+		}
+		payload.Project, _ = NormalizeProject(strings.TrimSpace(payload.Project))
+		if payload.Project != target {
+			continue
+		}
+		if modeStamped[id] {
+			refreshed, err := s.refreshPendingLocalSessionMutationTx(tx, payload)
+			if err != nil {
+				return false, err
+			}
+			journaled = journaled || refreshed
 		}
 		canonical, err := s.enqueueMissingLocalMutationTx(tx, SyncEntitySession, payload.ID, payload)
 		if err != nil {
@@ -6377,6 +7447,22 @@ func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sess
 	return journaled, nil
 }
 
+func (s *Store) refreshPendingLocalSessionMutationTx(tx *sql.Tx, payload syncSessionPayload) (bool, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+	res, err := s.execHook(tx, `UPDATE sync_mutations SET project = ?, payload = ?
+		WHERE target_key = ? AND entity = ? AND entity_key = ? AND op = ? AND source = ? AND acked_at IS NULL`,
+		payload.Project, string(encoded), DefaultSyncTargetKey, SyncEntitySession, payload.ID, SyncOpUpsert, SyncSourceLocal,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 func (s *Store) enqueueMissingLocalMutationTx(tx *sql.Tx, entity, entityKey string, payload any, ops ...string) (bool, error) {
 	project, _ := NormalizeProject(strings.TrimSpace(extractProjectFromPayload(payload)))
 	// A blank-owned payload has no project identity to reconcile against, so it
@@ -6402,9 +7488,11 @@ func (s *Store) enqueueMissingLocalMutationTx(tx *sql.Tx, entity, entityKey stri
 	return true, nil
 }
 
-// projectNeedsBackfill returns true when a project has any sessions, live observations,
-// or prompts that are missing a corresponding sync_mutation row.
-// It runs three lightweight COUNT queries — no cursor is held open.
+// projectNeedsBackfill returns true when a project has any backfillable source
+// row missing its corresponding sync_mutation row. It runs lightweight COUNT
+// queries — no cursor is held open. The predicates mirror the six backfill
+// sources: sessions, live/deleted observations, live/tombstoned prompts, and
+// eligible relations.
 func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 	type countQuery struct {
 		q    string
@@ -6438,6 +7526,17 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal},
 		},
 		{
+			q: `SELECT COUNT(*) FROM observations o
+			    LEFT JOIN sessions s ON s.id = o.session_id
+			    WHERE (ifnull(o.project,'') = ? OR (ifnull(o.project,'') = '' AND ifnull(s.project,'') = ?))
+			      AND o.deleted_at IS NOT NULL
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.op = ? AND sm.source = ?
+			      )`,
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal},
+		},
+		{
 			q: `SELECT COUNT(*) FROM user_prompts p
 			    LEFT JOIN sessions s ON s.id = p.session_id
 			    WHERE (ifnull(p.project,'') = ? OR (ifnull(p.project,'') = '' AND ifnull(s.project,'') = ?))
@@ -6446,6 +7545,16 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ?
 			      )`,
 			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal},
+		},
+		{
+			q: `SELECT COUNT(*) FROM prompt_tombstones p
+			    LEFT JOIN sessions s ON s.id = p.session_id
+			    WHERE (ifnull(p.project,'') = ? OR (ifnull(p.project,'') = '' AND ifnull(s.project,'') = ?))
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ? AND sm.op = ?
+			      )`,
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete},
 		},
 		{
 			// Count only fully-judged relations (not orphaned, not pending, with
@@ -6482,6 +7591,74 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// enrolledProjectsNeedingBackfill discovers all enrolled projects with at least
+// one journal row missing from the corresponding backfill SELECT. Keeping this
+// as one set-based query avoids running the detector once per enrolled project;
+// the actual backfill remains per-project and transactional.
+func (s *Store) enrolledProjectsNeedingBackfill() ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT ep.project
+		FROM sync_enrolled_projects ep
+		JOIN (
+			SELECT x.project
+			FROM sessions x
+			WHERE trim(x.id, ?) != ''
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.id AND sm.source = ?)
+			UNION
+			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
+			FROM observations x LEFT JOIN sessions xs ON xs.id = x.session_id
+			WHERE x.deleted_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ?)
+			UNION
+			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
+			FROM observations x LEFT JOIN sessions xs ON xs.id = x.session_id
+			WHERE x.deleted_at IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.op = ? AND sm.source = ?)
+			UNION
+			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
+			FROM user_prompts x LEFT JOIN sessions xs ON xs.id = x.session_id
+			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ?)
+			UNION
+			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
+			FROM prompt_tombstones x LEFT JOIN sessions xs ON xs.id = x.session_id
+			WHERE NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.sync_id AND sm.source = ? AND sm.op = ?)
+			UNION
+			SELECT coalesce(nullif(src.project, ''), src_s.project, '')
+			FROM memory_relations r
+			JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+			JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+			LEFT JOIN sessions src_s ON src_s.id = src.session_id
+			WHERE r.judgment_status NOT IN (?, ?)
+			  AND ifnull(r.marked_by_actor, '') != ''
+			  AND ifnull(r.marked_by_kind, '') != ''
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ?)
+		) candidates ON candidates.project = ep.project
+		ORDER BY ep.project ASC`,
+		sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete,
+		JudgmentStatusOrphaned, JudgmentStatusPending, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var projects []string
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return projects, nil
 }
 
 // EnsureEnrolledProjectSyncMutations repairs legacy enrolled-project journal
@@ -6534,36 +7711,13 @@ func (s *Store) EnsureEnrolledProjectSyncMutations(ctx context.Context) error {
 }
 
 func (s *Store) repairEnrolledProjectSyncMutations() error {
-	// Collect enrolled projects outside a transaction so we avoid holding a read
-	// cursor open while we later write inside backfillProjectSyncMutationsTx.
-	rows, err := s.db.Query(`SELECT project FROM sync_enrolled_projects ORDER BY project ASC`)
+	// Discover projects outside transactions; each selected project is still
+	// repaired atomically by the existing per-project backfill transaction.
+	projects, err := s.enrolledProjectsNeedingBackfill()
 	if err != nil {
 		return err
 	}
-	var projects []string
-	for rows.Next() {
-		var project string
-		if err := rows.Scan(&project); err != nil {
-			return closeRowsWithError(rows, err)
-		}
-		projects = append(projects, project)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
 	for _, project := range projects {
-		// Fast path: if the project is already fully backfilled, skip the write tx entirely.
-		needs, err := s.projectNeedsBackfill(project)
-		if err != nil {
-			return err
-		}
-		if !needs {
-			continue
-		}
 		if err := s.withTx(func(tx *sql.Tx) error {
 			return s.backfillProjectSyncMutationsTx(tx, project)
 		}); err != nil {
@@ -6573,13 +7727,14 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 	return nil
 }
 
-func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string, source ...string) error {
+	mutationSource := backfillMutationSource(source)
 	// Blank source identities are skipped, not enqueued: enqueueSyncMutationTx
 	// rejects them and a single corrupt row would otherwise roll back the whole
 	// backfill transaction. The predicate must stay identical to the COUNT in
 	// projectNeedsBackfill and to isBlankSessionID.
 	rows, err := s.queryItHook(tx, `
-		SELECT id, project, directory, started_at, ended_at, summary
+		SELECT id, project, ifnull(ownership_mode, ''), directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
 		  AND `+sqlSessionIDNotBlank("id")+`
@@ -6592,7 +7747,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 			  AND sm.source = ?
 		  )
 		ORDER BY started_at ASC, id ASC`,
-		project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, mutationSource,
 	)
 	if err != nil {
 		return err
@@ -6605,7 +7760,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 	var pending []syncSessionPayload
 	for rows.Next() {
 		var payload syncSessionPayload
-		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
+		if err := rows.Scan(&payload.ID, &payload.Project, &payload.OwnershipMode, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
 			return closeRowsWithError(rows, err)
 		}
 		pending = append(pending, payload)
@@ -6619,14 +7774,15 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 
 	// Phase 2: insert now that the read cursor is closed.
 	for _, payload := range pending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload, mutationSource); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string, source ...string) error {
+	mutationSource := backfillMutationSource(source)
 	// ── Live observations ─────────────────────────────────────────────────────
 	rows, err := s.queryItHook(tx, `
 		SELECT o.sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project, o.scope, o.topic_key,
@@ -6647,7 +7803,7 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 			  AND sm.source = ?
 		  )
 		ORDER BY o.id ASC`,
-		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, mutationSource,
 	)
 	if err != nil {
 		return err
@@ -6686,7 +7842,7 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 
 	// Phase 2: insert live observation mutations.
 	for _, payload := range pending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload, mutationSource); err != nil {
 			return err
 		}
 	}
@@ -6711,7 +7867,7 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 			  AND sm.source = ?
 		  )
 		ORDER BY o.id ASC`,
-		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, mutationSource,
 	)
 	if err != nil {
 		return err
@@ -6737,14 +7893,15 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 
 	// Phase 2: insert deleted observation mutations.
 	for _, payload := range deletedPending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpDelete, payload); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntityObservation, payload.SyncID, SyncOpDelete, payload, mutationSource); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string, source ...string) error {
+	mutationSource := backfillMutationSource(source)
 	// ── Live prompts ──────────────────────────────────────────────────────────
 	rows, err := s.queryItHook(tx, `
 		SELECT p.sync_id, p.session_id, p.content, p.project, p.created_at
@@ -6763,7 +7920,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 			  AND sm.source = ?
 		  )
 		ORDER BY p.id ASC`,
-		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource,
 	)
 	if err != nil {
 		return err
@@ -6787,7 +7944,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 
 	// Phase 2: insert live prompt mutations.
 	for _, payload := range pending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpUpsert, payload); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpUpsert, payload, mutationSource); err != nil {
 			return err
 		}
 	}
@@ -6811,7 +7968,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 			  AND sm.op = ?
 		  )
 		ORDER BY deleted_at ASC`,
-		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, mutationSource, SyncOpDelete,
 	)
 	if err != nil {
 		return err
@@ -6837,7 +7994,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 
 	// Phase 2: insert tombstone mutations.
 	for _, payload := range tombstonePending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload, mutationSource); err != nil {
 			return err
 		}
 	}
@@ -6860,7 +8017,8 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 // ExportRelationMutations additionally filters by tgt.project; the backfill
 // intentionally omits that filter to avoid skipping cross-project edges where
 // only the source belongs to this project.
-func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string, source ...string) error {
+	mutationSource := backfillMutationSource(source)
 	// Only backfill fully-judged relations: exclude orphaned/pending and any row
 	// that is missing marked_by_actor or marked_by_kind.  Cloud validation
 	// (chunkcodec + server) hard-rejects mutations without those fields (HTTP 400),
@@ -6890,7 +8048,7 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 		ORDER BY r.created_at ASC, r.sync_id ASC`,
 		JudgmentStatusOrphaned, JudgmentStatusPending,
 		project,
-		DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityRelation, mutationSource,
 	)
 	if err != nil {
 		return err
@@ -6918,7 +8076,7 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 
 	// Phase 2: insert now that the read cursor is closed.
 	for _, p := range pending {
-		if err := s.enqueueSyncMutationTx(tx, SyncEntityRelation, p.SyncID, SyncOpUpsert, p); err != nil {
+		if err := s.enqueueSyncMutationWithSourceTx(tx, SyncEntityRelation, p.SyncID, SyncOpUpsert, p, mutationSource); err != nil {
 			return err
 		}
 	}
@@ -6926,8 +8084,16 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 }
 
 func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
+	return s.enqueueSyncMutationWithSourceTx(tx, entity, entityKey, op, payload, SyncSourceLocal)
+}
+
+func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, op string, payload any, source string) error {
 	if entity == SyncEntitySession && strings.TrimSpace(entityKey) == "" {
 		return ErrSessionIDRequired
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = SyncSourceLocal
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -6954,7 +8120,7 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 	res, err := s.execHook(tx,
 		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		DefaultSyncTargetKey, entity, entityKey, op, string(encoded), SyncSourceLocal, project,
+		DefaultSyncTargetKey, entity, entityKey, op, string(encoded), source, project,
 	)
 	if err != nil {
 		return err
@@ -7051,17 +8217,39 @@ func rescueOwnershipHint(sessionID string) string {
 // sessionOwnershipTx reads one session's ownership. found reports whether the
 // session row exists; project is empty when the row carries NULL or blank
 // ownership, which are the two legacy shapes that identify no project.
-func sessionOwnershipTx(tx *sql.Tx, sessionID string) (project string, found bool, err error) {
-	var raw sql.NullString
-	err = tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, sessionID).Scan(&raw)
+func sessionOwnershipTx(tx *sql.Tx, sessionID string) (project, mode string, found bool, err error) {
+	var rawProject, rawMode sql.NullString
+	err = tx.QueryRow(`SELECT project, ownership_mode FROM sessions WHERE id = ?`, sessionID).Scan(&rawProject, &rawMode)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	normalized, _ := NormalizeProject(strings.TrimSpace(raw.String))
-	return normalized, true, nil
+	normalized, _ := NormalizeProject(strings.TrimSpace(rawProject.String))
+	return normalized, strings.TrimSpace(rawMode.String), true, nil
+}
+
+func sessionEndedTx(tx *sql.Tx, sessionID string) (bool, error) {
+	var endedAt sql.NullString
+	err := tx.QueryRow(`SELECT ended_at FROM sessions WHERE id = ?`, sessionID).Scan(&endedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return endedAt.Valid, nil
+}
+
+func sessionProjectWriteError(sessionID, sessionProject, mode, requested string) error {
+	if sessionProject == "" || sessionProject == requested || mode == SessionOwnershipShared {
+		return nil
+	}
+	if mode == SessionOwnershipProjectOwned {
+		return fmt.Errorf("%w: session %q belongs to %q, not %q", ErrSessionOwnershipMismatch, sessionID, sessionProject, requested)
+	}
+	return fmt.Errorf("%w: session %q has unclassified ownership for %q and cannot accept %q", ErrProjectOwnershipAmbiguous, sessionID, sessionProject, requested)
 }
 
 // foreignRecordOwnerTx returns the first project, other than exclude, that owns
@@ -7117,7 +8305,7 @@ func foreignRecordOwnerTx(tx *sql.Tx, sessionID, exclude string) (string, string
 // it there would split that record from its session.
 func (s *Store) resolveWriteProjectTx(tx *sql.Tx, sessionID, requested string) (string, error) {
 	requested, _ = NormalizeProject(strings.TrimSpace(requested))
-	sessionProject, found, err := sessionOwnershipTx(tx, sessionID)
+	sessionProject, mode, found, err := sessionOwnershipTx(tx, sessionID)
 	if err != nil {
 		return "", err
 	}
@@ -7136,6 +8324,9 @@ func (s *Store) resolveWriteProjectTx(tx *sql.Tx, sessionID, requested string) (
 		}
 		return sessionProject, nil
 	}
+	if err := sessionProjectWriteError(sessionID, sessionProject, mode, requested); err != nil {
+		return "", err
+	}
 
 	// The session already agrees, or does not exist yet (callers create it
 	// separately); nothing to repair.
@@ -7143,8 +8334,7 @@ func (s *Store) resolveWriteProjectTx(tx *sql.Tx, sessionID, requested string) (
 		return requested, nil
 	}
 	if sessionProject != "" {
-		// An owned session keeps its ownership; the caller decides whether a
-		// mismatch is an error. This preserves existing behavior.
+		// Shared sessions deliberately accept writes for multiple projects.
 		return requested, nil
 	}
 
@@ -7180,8 +8370,8 @@ func (s *Store) adoptSessionOwnershipTx(tx *sql.Tx, sessionID, project string) e
 	}
 	var payload syncSessionPayload
 	err = tx.QueryRow(
-		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, sessionID,
-	).Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
+		`SELECT id, project, ifnull(ownership_mode, ''), directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&payload.ID, &payload.Project, &payload.OwnershipMode, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary)
 	if err != nil {
 		return err
 	}
@@ -7566,16 +8756,22 @@ func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) er
 	if isSessionDeletePayload(payload) {
 		return s.applySessionDeleteTx(tx, payload)
 	}
+	if strings.TrimSpace(payload.OwnershipMode) != "" && !validSessionOwnershipMode(payload.OwnershipMode) {
+		return fmt.Errorf("%w %q", ErrInvalidSessionOwnershipMode, payload.OwnershipMode)
+	}
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, directory, started_at, ended_at, summary)
-		 VALUES (?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)
+		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at, ended_at, summary)
+		 VALUES (?, ?, COALESCE(?, 'shared'), ?, COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
-		   project = excluded.project,
+		   project = CASE WHEN sessions.ownership_mode = 'project_owned' THEN sessions.project ELSE excluded.project END,
+		   ownership_mode = CASE
+		     WHEN sessions.ownership_mode = 'project_owned' OR excluded.ownership_mode IS NULL THEN sessions.ownership_mode
+		     ELSE excluded.ownership_mode END,
 		   directory = excluded.directory,
 		   started_at = COALESCE(NULLIF(excluded.started_at, ''), sessions.started_at),
 		   ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
 		   summary = COALESCE(excluded.summary, sessions.summary)`,
-		payload.ID, payload.Project, payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
+		payload.ID, payload.Project, nullableOwnershipMode(payload.OwnershipMode), payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
 	)
 	return err
 }
@@ -7759,13 +8955,20 @@ func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayl
 		return err
 	}
 	deletedAt := payload.DeletedAt
+	updatedAt := strings.TrimSpace(payload.UpdatedAt)
 	if deletedAt == nil {
 		now := Now()
 		deletedAt = &now
+		if updatedAt == "" {
+			updatedAt = now
+		}
+	}
+	if updatedAt == "" {
+		updatedAt = *deletedAt
 	}
 	_, err = s.execHook(tx,
-		`UPDATE observations SET deleted_at = ?, updated_at = datetime('now') WHERE id = ?`,
-		deletedAt, existing.ID,
+		`UPDATE observations SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+		deletedAt, updatedAt, existing.ID,
 	)
 	return err
 }
@@ -7839,21 +9042,19 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 
 func isStalePromptUpsert(payload syncPromptPayload, tombstoneDeletedAt string) bool {
 	upsertTime := normalizeComparableTimestamp(payload.CreatedAt)
-	if strings.TrimSpace(upsertTime) == "" {
+	tombstoneTime := normalizeComparableTimestamp(tombstoneDeletedAt)
+	if upsertTime == "" || tombstoneTime == "" {
 		return true
 	}
-	return upsertTime <= normalizeComparableTimestamp(tombstoneDeletedAt)
+	return upsertTime <= tombstoneTime
 }
 
 func normalizeComparableTimestamp(value string) string {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
+	parsed, err := parseObservationTime(value)
+	if err != nil {
 		return ""
 	}
-	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
-		return parsed.UTC().Format("2006-01-02 15:04:05")
-	}
-	return trimmed
+	return parsed.UTC().Format("2006-01-02 15:04:05.000000000")
 }
 
 func parseObservationTime(value string) (time.Time, error) {
@@ -7880,6 +9081,17 @@ func scanObservationRow(scanner observationScanner, o *Observation) error {
 		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
 		&o.Pinned, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 	)
+}
+
+func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool) error {
+	dest := []any{
+		&r.ID, &r.SyncID, &r.Type, &r.Title, &r.Preview, &r.Truncated,
+		&r.Project, &r.Scope, &r.ReviewAfter, &r.Pinned, &r.CreatedAt,
+	}
+	if withRank {
+		dest = append(dest, &r.Rank)
+	}
+	return scanner.Scan(dest...)
 }
 
 func (s *Store) queryObservations(query string, args ...any) ([]Observation, error) {

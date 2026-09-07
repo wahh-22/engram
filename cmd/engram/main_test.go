@@ -16,13 +16,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/mcp"
-	"github.com/Gentleman-Programming/engram/internal/obsidian"
-	"github.com/Gentleman-Programming/engram/internal/project"
-	"github.com/Gentleman-Programming/engram/internal/setup"
-	"github.com/Gentleman-Programming/engram/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
-	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
+	"github.com/Gentleman-Programming/engram/v2/internal/mcp"
+	"github.com/Gentleman-Programming/engram/v2/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/v2/internal/project"
+	"github.com/Gentleman-Programming/engram/v2/internal/setup"
+	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	versioncheck "github.com/Gentleman-Programming/engram/v2/internal/version"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
@@ -341,6 +341,12 @@ func TestPrintUsage(t *testing.T) {
 }
 
 func TestPrintPostInstall(t *testing.T) {
+	const (
+		mcpConfiguredMessage = "Configuration written: the OpenCode plugin and Engram MCP registration."
+		mcpManualMessage     = "Plugin written, but Engram MCP registration needs the manual configuration shown above."
+		toolGuidance         = "confirm it can use an `engram_mem_*` tool before relying on Engram."
+	)
+
 	tests := []struct {
 		name       string
 		result     *setup.Result
@@ -349,15 +355,27 @@ func TestPrintPostInstall(t *testing.T) {
 	}{
 		{
 			name:       "opencode with subagent monitor enabled",
-			result:     &setup.Result{Agent: "opencode", TUIPluginEnabled: true},
-			expects:    []string{"Restart OpenCode", "opencode-subagent-statusline", "auto-starts"},
-			notExpects: []string{"engram serve &"},
+			result:     &setup.Result{Agent: "opencode", MCPConfigured: true, TUIPluginEnabled: true},
+			expects:    []string{mcpConfiguredMessage, "opencode mcp list", toolGuidance, "cannot verify tool exposure", "opencode-subagent-statusline", "auto-starts"},
+			notExpects: []string{mcpManualMessage, "engram serve &"},
 		},
 		{
-			name:       "opencode with subagent monitor not enabled",
-			result:     &setup.Result{Agent: "opencode", TUIPluginEnabled: false},
-			expects:    []string{"Restart OpenCode", "auto-starts"},
-			notExpects: []string{"opencode-subagent-statusline", "engram serve &"},
+			name:       "opencode with MCP configured and subagent monitor disabled",
+			result:     &setup.Result{Agent: "opencode", MCPConfigured: true, TUIPluginEnabled: false},
+			expects:    []string{mcpConfiguredMessage, "opencode mcp list", toolGuidance, "cannot verify tool exposure", "auto-starts"},
+			notExpects: []string{mcpManualMessage, "opencode-subagent-statusline", "engram serve &"},
+		},
+		{
+			name:       "opencode with incomplete MCP registration and subagent monitor enabled",
+			result:     &setup.Result{Agent: "opencode", MCPConfigured: false, TUIPluginEnabled: true},
+			expects:    []string{mcpManualMessage, "opencode mcp list", toolGuidance, "cannot verify tool exposure", "opencode-subagent-statusline", "auto-starts"},
+			notExpects: []string{mcpConfiguredMessage, "engram serve &"},
+		},
+		{
+			name:       "opencode with incomplete MCP registration",
+			result:     &setup.Result{Agent: "opencode", MCPConfigured: false, TUIPluginEnabled: false},
+			expects:    []string{mcpManualMessage, "opencode mcp list", toolGuidance, "cannot verify tool exposure", "auto-starts"},
+			notExpects: []string{mcpConfiguredMessage, "opencode-subagent-statusline", "engram serve &"},
 		},
 		{
 			name:       "pi",
@@ -731,12 +749,16 @@ func TestCmdSaveUsesDetectionSeamAndPrintsNormalizationWarning(t *testing.T) {
 	cfg := testConfig(t)
 	cwd := t.TempDir()
 	withCwd(t, cwd)
+	actualCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get current working directory: %v", err)
+	}
 	withArgs(t, "engram", "save", "resolved-title", "resolved-content")
 
 	originalDetectProjectFull := detectProjectFull
 	detectProjectFull = func(gotCWD string) project.DetectionResult {
-		if gotCWD != cwd {
-			t.Fatalf("detection cwd = %q, want %q", gotCWD, cwd)
+		if gotCWD != actualCWD {
+			t.Fatalf("detection cwd = %q, want %q", gotCWD, actualCWD)
 		}
 		return project.DetectionResult{Project: " Configured--Project "}
 	}
@@ -874,6 +896,15 @@ func TestCmdExportAndImport(t *testing.T) {
 	if !strings.Contains(importOut, "Imported from "+exportPath) {
 		t.Fatalf("unexpected import output: %q", importOut)
 	}
+	for _, want := range []string{
+		"  Sessions:",
+		"  Observations: 1 imported, 0 updated, 0 skipped stale",
+		"  Prompts:",
+	} {
+		if !strings.Contains(importOut, want) {
+			t.Fatalf("import output missing %q: %q", want, importOut)
+		}
+	}
 
 	s, err := store.New(targetCfg)
 	if err != nil {
@@ -978,7 +1009,14 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 	oldVersion := version
 	version = "9.9.9-test"
 	t.Cleanup(func() { version = oldVersion })
-	stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
+
+	checks := 0
+	oldCheckForUpdates := checkForUpdates
+	checkForUpdates = func(string) versioncheck.CheckResult {
+		checks++
+		return versioncheck.CheckResult{Status: versioncheck.StatusUpToDate}
+	}
+	t.Cleanup(func() { checkForUpdates = oldCheckForUpdates })
 
 	tests := []struct {
 		name      string
@@ -996,6 +1034,7 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			checks = 0
 			withArgs(t, "engram", tc.arg)
 			stdout, stderr := captureOutput(t, func() { main() })
 			if tc.notStderr && stderr != "" {
@@ -1004,55 +1043,42 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 			if !strings.Contains(stdout, tc.contains) {
 				t.Fatalf("stdout %q does not include %q", stdout, tc.contains)
 			}
+			if checks != 0 {
+				t.Fatalf("update checks = %d, want 0", checks)
+			}
 		})
 	}
 }
 
 func TestMainPrintsUpdateFailuresAndUpdates(t *testing.T) {
-	oldVersion := version
-	version = "1.10.7"
-	t.Cleanup(func() { version = oldVersion })
-
 	t.Run("prints check failure", func(t *testing.T) {
-		stubCheckForUpdates(t, versioncheck.CheckResult{
-			Status:  versioncheck.StatusCheckFailed,
-			Message: "Could not check for updates: GitHub took too long to respond.",
+		_, stderr := captureOutput(t, func() {
+			printUpdateCheckResult(versioncheck.CheckResult{
+				Status:  versioncheck.StatusCheckFailed,
+				Message: "Could not check for updates: GitHub took too long to respond.",
+			})
 		})
-		withArgs(t, "engram", "version")
-
-		stdout, stderr := captureOutput(t, func() { main() })
-		if !strings.Contains(stdout, "engram 1.10.7") {
-			t.Fatalf("stdout = %q", stdout)
-		}
 		if !strings.Contains(stderr, "Could not check for updates") {
 			t.Fatalf("stderr = %q", stderr)
 		}
 	})
 
 	t.Run("prints available update", func(t *testing.T) {
-		stubCheckForUpdates(t, versioncheck.CheckResult{
-			Status:  versioncheck.StatusUpdateAvailable,
-			Message: "Update available: 1.10.7 -> 1.10.8",
+		_, stderr := captureOutput(t, func() {
+			printUpdateCheckResult(versioncheck.CheckResult{
+				Status:  versioncheck.StatusUpdateAvailable,
+				Message: "Update available: 1.10.7 -> 1.10.8",
+			})
 		})
-		withArgs(t, "engram", "version")
-
-		stdout, stderr := captureOutput(t, func() { main() })
-		if !strings.Contains(stdout, "engram 1.10.7") {
-			t.Fatalf("stdout = %q", stdout)
-		}
 		if !strings.Contains(stderr, "Update available") {
 			t.Fatalf("stderr = %q", stderr)
 		}
 	})
 
 	t.Run("prints nothing when up to date", func(t *testing.T) {
-		stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
-		withArgs(t, "engram", "version")
-
-		stdout, stderr := captureOutput(t, func() { main() })
-		if !strings.Contains(stdout, "engram 1.10.7") {
-			t.Fatalf("stdout = %q", stdout)
-		}
+		_, stderr := captureOutput(t, func() {
+			printUpdateCheckResult(versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
+		})
 		if stderr != "" {
 			t.Fatalf("stderr = %q, want empty", stderr)
 		}
@@ -1569,21 +1595,30 @@ func TestCmdProjectsConsolidateDryRun(t *testing.T) {
 	// Seed a canonical name and rewrite a second project's records as a legacy case variant.
 	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
 	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	mustSeedObservation(t, cfg, "s-padded", "padded-source", "note", "padded note", "content", "project")
 	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
+	rewriteLegacyProjectName(t, cfg, "padded-source", " ENGRAM ")
 
 	old := detectProject
 	detectProject = func(string) string { return "engram" }
 	t.Cleanup(func() { detectProject = old })
+
+	oldScan := scanInputLine
+	scanInputLine = func(a ...any) (int, error) {
+		*a[0].(*string) = "1"
+		return 1, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
 
 	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
 	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "dry-run") {
-		t.Fatalf("expected dry-run message, got: %q", stdout)
+	if !strings.Contains(stdout, "[dry-run] Would merge 1 project(s)") {
+		t.Fatalf("expected selected dry-run plan, got: %q", stdout)
 	}
-	// Verify no actual merge happened (both project names still exist).
+	// Verify no actual merge happened.
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
@@ -1593,9 +1628,55 @@ func TestCmdProjectsConsolidateDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListProjectNames: %v", err)
 	}
-	// Should still have both names (no merge happened)
-	if len(names) != 2 || names[0] != "ENGRAM" || names[1] != "engram" {
+	// All three names remain because dry-run performs no merge.
+	if len(names) != 3 || !slices.Contains(names, " ENGRAM ") || !slices.Contains(names, "ENGRAM") || !slices.Contains(names, "engram") {
 		t.Fatalf("expected legacy and canonical names after dry-run, got: %v", names)
+	}
+}
+
+func TestCmdProjectsConsolidateDryRunRequiresSelection(t *testing.T) {
+	cfg := testConfig(t)
+
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
+	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
+
+	oldDetect := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = oldDetect })
+
+	oldScan := scanInputLine
+	scanInputLine = func(...any) (int, error) { return 0, io.EOF }
+	t.Cleanup(func() { scanInputLine = oldScan })
+
+	exitCode := 0
+	oldExit := exitFunc
+	exitFunc = func(code int) { exitCode = code }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1", exitCode)
+	}
+	if !strings.Contains(stderr, "dry-run requires a confirmed selection") {
+		t.Fatalf("expected selection error, got: %q", stderr)
+	}
+	if strings.Contains(stdout, "[dry-run] Would merge") {
+		t.Fatalf("dry-run emitted an unselected merge plan: %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	if len(names) != 2 || names[0] != "ENGRAM" || names[1] != "engram" {
+		t.Fatalf("dry-run without selection mutated projects: %v", names)
 	}
 }
 
@@ -1653,6 +1734,13 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	mustSeedObservation(t, cfg, "s-legacy", "legacy-source", "note", "legacy note", "content", "project")
 	rewriteLegacyProjectName(t, cfg, "legacy-source", "ENGRAM")
 
+	oldScan := scanInputLine
+	scanInputLine = func(...any) (int, error) {
+		t.Fatal("--all dry-run must not require a selection")
+		return 0, nil
+	}
+	t.Cleanup(func() { scanInputLine = oldScan })
+
 	withArgs(t, "engram", "projects", "consolidate", "--all", "--dry-run")
 	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
@@ -1663,6 +1751,19 @@ func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `Would merge into "engram"`) {
 		t.Fatalf("expected normalized canonical in dry-run output, got: %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	if len(names) != 2 || names[0] != "ENGRAM" || names[1] != "engram" {
+		t.Fatalf("--all dry-run mutated projects: %v", names)
 	}
 }
 
@@ -2307,16 +2408,18 @@ func TestCmdMCPServesBeforeDeferredEnrolledProjectRepair(t *testing.T) {
 	}
 }
 
-func TestCmdSyncUsesDetectProject(t *testing.T) {
+func TestCmdSyncUsesFullProjectDetection(t *testing.T) {
 	workDir := t.TempDir()
 	withCwd(t, workDir)
 
 	cfg := testConfig(t)
 
-	// Stub detectProject to verify it's called instead of filepath.Base
-	old := detectProject
-	t.Cleanup(func() { detectProject = old })
-	detectProject = func(dir string) string { return "git-detected-project" }
+	// Stub full detection so sync preserves fail-closed automatic Git detection.
+	old := detectProjectFull
+	t.Cleanup(func() { detectProjectFull = old })
+	detectProjectFull = func(dir string) project.DetectionResult {
+		return project.DetectionResult{Project: "git-detected-project", Source: project.SourceGitRemote, Path: dir}
+	}
 
 	withArgs(t, "engram", "sync")
 	stdout, stderr := captureOutput(t, func() { cmdSync(cfg) })
@@ -2324,7 +2427,62 @@ func TestCmdSyncUsesDetectProject(t *testing.T) {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
 	if !strings.Contains(stdout, "git-detected-project") {
-		t.Fatalf("expected detectProject result in output, got: %q", stdout)
+		t.Fatalf("expected full detection result in output, got: %q", stdout)
+	}
+}
+
+func TestCmdSyncFailsClosedWhenFullProjectDetectionFails(t *testing.T) {
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+	t.Setenv("ENGRAM_PROJECT", "")
+	stubExitWithPanic(t)
+
+	oldDetectProjectFull := detectProjectFull
+	oldSyncExport := syncExport
+	t.Cleanup(func() {
+		detectProjectFull = oldDetectProjectFull
+		syncExport = oldSyncExport
+	})
+
+	for _, tt := range []struct {
+		name   string
+		detect project.DetectionResult
+		want   error
+	}{
+		{
+			name:   "repository binding unavailable",
+			detect: project.DetectionResult{Source: project.SourceGitRoot, Path: workDir, Error: fmt.Errorf("%w: test binding failure", project.ErrRepositoryBinding)},
+			want:   project.ErrRepositoryBinding,
+		},
+		{
+			name:   "invalid project config",
+			detect: project.DetectionResult{Source: project.SourceConfig, Path: workDir, Error: fmt.Errorf("%w: test config failure", project.ErrInvalidConfig)},
+			want:   project.ErrInvalidConfig,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			detectProjectFull = func(string) project.DetectionResult { return tt.detect }
+			exportCalled := false
+			syncExport = func(*engramsync.Syncer, string, string) (*engramsync.SyncResult, error) {
+				exportCalled = true
+				return nil, errors.New("syncExport must not run after project detection failure")
+			}
+
+			withArgs(t, "engram", "sync")
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(testConfig(t)) })
+			if _, ok := recovered.(exitCode); !ok {
+				t.Fatalf("cmdSync recovery = %v, want exit code", recovered)
+			}
+			if !strings.Contains(stderr, tt.want.Error()) {
+				t.Fatalf("stderr %q does not contain detection error %q", stderr, tt.want)
+			}
+			if exportCalled {
+				t.Fatal("cmdSync invoked syncExport after project detection failed")
+			}
+			if strings.Contains(stdout, "Exporting memories") {
+				t.Fatalf("cmdSync emitted export output after project detection failed: %q", stdout)
+			}
+		})
 	}
 }
 

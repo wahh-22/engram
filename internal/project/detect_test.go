@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -788,6 +789,68 @@ func TestDetectProjectFull_WorktreeUsesPrimaryRepositoryIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeWorktreeDirectoryKeepsLinkedWorktreesDistinct(t *testing.T) {
+	parent := t.TempDir()
+	primary := filepath.Join(parent, "primary")
+	sibling := filepath.Join(parent, "sibling")
+	if err := os.MkdirAll(primary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, primary)
+	commitEmptyGit(t, primary)
+	addGitWorktree(t, primary, sibling, "sibling")
+	if err := os.MkdirAll(filepath.Join(sibling, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	primaryDirectory := RuntimeWorktreeDirectory(primary)
+	siblingDirectory := RuntimeWorktreeDirectory(filepath.Join(sibling, "nested"))
+	if primaryDirectory != runtimeCanonicalizePath(primary) {
+		t.Fatalf("primary runtime directory = %q, want %q", primaryDirectory, runtimeCanonicalizePath(primary))
+	}
+	if siblingDirectory != runtimeCanonicalizePath(sibling) {
+		t.Fatalf("sibling runtime directory = %q, want %q", siblingDirectory, runtimeCanonicalizePath(sibling))
+	}
+	if primaryDirectory == siblingDirectory {
+		t.Fatalf("linked worktree runtime directories collapsed to %q", primaryDirectory)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryNormalizesCaseOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only path case normalization")
+	}
+	dir := filepath.Join(t.TempDir(), "CaseSensitive")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, dir)
+
+	actual := RuntimeWorktreeDirectory(dir)
+	equivalent := RuntimeWorktreeDirectory(strings.ToLower(dir))
+	if equivalent != actual {
+		t.Fatalf("case-equivalent worktree directory = %q, want %q", equivalent, actual)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryFallsBackToNonGitDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if got, want := RuntimeWorktreeDirectory("."), runtimeCanonicalizePath(dir); got != want {
+		t.Fatalf("non-Git runtime directory = %q, want %q", got, want)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryUsesCurrentDirectoryForWhitespaceInput(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if got, want := RuntimeWorktreeDirectory(" \t "), runtimeCanonicalizePath(dir); got != want {
+		t.Fatalf("whitespace runtime directory = %q, want %q", got, want)
+	}
+}
+
 func TestDetectProjectFull_WorktreeRemoteUsesPrimaryRepositoryPath(t *testing.T) {
 	parent := t.TempDir()
 	repo := filepath.Join(parent, "canonical-repo")
@@ -839,7 +902,8 @@ func TestDetectProjectFull_SubmoduleUsesCheckoutRoot(t *testing.T) {
 }
 
 func TestDetectProjectFull_BareRepositoryUsesRepositoryName(t *testing.T) {
-	bare := filepath.Join(t.TempDir(), "canonical-repo.git")
+	parent := t.TempDir()
+	bare := filepath.Join(parent, "canonical-repo.git")
 	cmd := exec.Command("git", "init", "--bare", bare)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare: %v\n%s", err, out)
@@ -849,7 +913,8 @@ func TestDetectProjectFull_BareRepositoryUsesRepositoryName(t *testing.T) {
 	if res.Source != SourceGitRoot || res.Project != "canonical-repo" {
 		t.Fatalf("bare repository result = %+v, want git-root canonical-repo", res)
 	}
-	if got, want := canonicalizePath(res.Path), canonicalizePath(filepath.Join(filepath.Dir(bare), "canonical-repo")); got != want {
+	canonicalParent := canonicalizePath(parent)
+	if got, want := canonicalizePath(res.Path), filepath.Join(canonicalParent, "canonical-repo"); got != want {
 		t.Fatalf("bare repository path = %q, want %q", got, want)
 	}
 }
