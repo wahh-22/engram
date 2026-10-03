@@ -23,9 +23,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/diagnostic"
-	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/diagnostic"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 var loadServerStats = func(s *store.Store) (*store.Stats, error) {
@@ -86,11 +86,15 @@ type Server struct {
 	// When nil and semantic=true, a no-op builder is used (returns empty string).
 	promptBuilder SemanticPromptBuilder
 	// version is reported by GET /health and defaults to "dev" for local builds.
-	version string
+	version    string
+	instanceID string
 }
 
 func New(s *store.Store, port int) *Server {
 	srv := &Server{store: s, port: port, listen: net.Listen, serve: http.Serve, version: "dev"}
+	if s != nil {
+		srv.instanceID = s.InstanceID()
+	}
 	srv.mux = http.NewServeMux()
 	srv.routes()
 	return srv
@@ -259,6 +263,13 @@ func (s *Server) Start() error {
 		ln, err = listenFn(network, addr)
 	}
 	if err != nil {
+		if socketPath == "" && isAddressInUse(err) {
+			if s.instanceOwnsPort() {
+				log.Printf("[engram] HTTP server did not bind on %s: an existing instance owns the port", addr)
+				return nil
+			}
+			return fmt.Errorf("engram server: listen %s: already owned by a different or legacy instance", addr)
+		}
 		return fmt.Errorf("engram server: listen %s: %w", addr, err)
 	}
 
@@ -281,6 +292,34 @@ func (s *Server) Start() error {
 		return nil
 	}
 	return err
+}
+
+func isAddressInUse(err error) bool {
+	message := strings.ToLower(err.Error())
+	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(message, "address already in use") || strings.Contains(message, "only one usage of each socket address")
+}
+
+func (s *Server) instanceOwnsPort() bool {
+	if s.instanceID == "" {
+		return false
+	}
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	for attempt := 0; attempt < 5; attempt++ {
+		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", s.port))
+		if err == nil {
+			var health struct {
+				InstanceID string `json:"instance_id"`
+			}
+			err = json.NewDecoder(response.Body).Decode(&health)
+			_ = response.Body.Close()
+			if err == nil && health.InstanceID == s.instanceID {
+				return true
+			}
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // Close stops the active listener and removes only the socket created by this
@@ -393,8 +432,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /observations", s.handleListObservations)
 	s.mux.HandleFunc("POST /observations/passive", s.handlePassiveCapture)
 	s.mux.HandleFunc("GET /observations/recent", s.handleRecentObservations)
+	// Pin state is local-only metadata and remains open with ENGRAM_HTTP_TOKEN like other non-destructive local HTTP writes.
+	s.mux.HandleFunc("PUT /observations/{id}/pin", s.handlePinObservation)
+	s.mux.HandleFunc("DELETE /observations/{id}/pin", s.handleUnpinObservation)
 	s.mux.HandleFunc("PATCH /observations/{id}", s.handleUpdateObservation)
 	s.mux.HandleFunc("DELETE /observations/{id}", requireAuth(s.handleDeleteObservation))
+	// Topic-key suggestion is read-only and remains open under the local HTTP policy.
+	s.mux.HandleFunc("POST /topic-keys/suggest", s.handleSuggestTopicKey)
 
 	// Search
 	s.mux.HandleFunc("GET /search", s.handleSearch)
@@ -423,6 +467,9 @@ func (s *Server) routes() {
 
 	// Stats / diagnostics
 	s.mux.HandleFunc("GET /stats", s.handleStats)
+	// Project listing is read-only and mirrors the MCP mem_list_projects tool and
+	// `engram projects list`, all backed by the same ListProjectsWithStats store query.
+	s.mux.HandleFunc("GET /projects", s.handleListProjects)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
 
 	// Project detection / ownership rescue
@@ -448,10 +495,16 @@ func (s *Server) routes() {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.store.Stats(); err != nil {
+		jsonError(w, http.StatusInternalServerError, "health check failed")
+		return
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"service": "engram",
-		"version": s.version,
+		"status":       "ok",
+		"service":      "engram",
+		"version":      s.version,
+		"instance_id":  s.instanceID,
+		"capabilities": map[string]bool{"isolated_session_registration": true},
 	})
 }
 
@@ -461,6 +514,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Project       string `json:"project"`
 		Directory     string `json:"directory"`
 		OwnershipMode string `json:"ownership_mode"`
+		Resume        bool   `json:"resume"`
+		Isolated      bool   `json:"isolated"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -475,17 +530,50 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = store.SessionOwnershipShared
 	}
-	if err := s.store.CreateSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode); err != nil {
-		if errors.Is(err, store.ErrInvalidSessionOwnershipMode) {
+	if body.Isolated && (mode != store.SessionOwnershipProjectOwned || strings.TrimSpace(body.Directory) != "") {
+		jsonError(w, http.StatusBadRequest, "isolated registration requires project_owned ownership and an empty directory")
+		return
+	}
+	effectiveID := body.ID
+	var err error
+	if body.Isolated {
+		effectiveID, err = s.store.RegisterIsolatedSession(body.ID, body.Project, body.Resume)
+	} else if body.Resume {
+		effectiveID, err = s.store.ResumeSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
+	} else {
+		err = s.store.StartSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
+	}
+	if err != nil {
+		var conflict *store.SessionProjectConflictError
+		switch {
+		case errors.Is(err, store.ErrSessionIsolationConflict):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{"code": "session_isolation_conflict"})
+		case errors.Is(err, store.ErrSessionAlreadyEnded):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+				"code":       "session_already_ended",
+				"session_id": body.ID,
+			})
+		case errors.As(err, &conflict):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+				"code":              "session_project_conflict",
+				"session_id":        conflict.SessionID,
+				"owner_project":     conflict.OwnerProject,
+				"requested_project": conflict.RequestedProject,
+			})
+		case errors.Is(err, store.ErrInvalidSessionOwnershipMode):
 			jsonError(w, http.StatusBadRequest, err.Error())
-			return
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
 		}
-		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	s.notifyWrite()
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": body.ID, "status": "created"})
+	ack := map[string]string{"id": effectiveID, "status": "created"}
+	if effectiveID != body.ID {
+		ack["resumed_from"] = body.ID
+	}
+	jsonResponse(w, http.StatusCreated, ack)
 }
 
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
@@ -706,17 +794,26 @@ func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if body.Type == nil && body.Title == nil && body.Content == nil && body.Project == nil && body.Scope == nil && body.TopicKey == nil {
+	if body.Type == nil && body.Title == nil && body.Content == nil && body.Find == nil && body.Replace == nil && body.Project == nil && body.Scope == nil && body.TopicKey == nil {
 		jsonError(w, http.StatusBadRequest, "at least one field is required")
 		return
 	}
 
-	obs, err := s.store.UpdateObservation(id, body)
+	obs, err := s.store.UpdateObservationForProject(id, r.URL.Query().Get("expected_project"), body)
 	if err != nil {
 		switch {
-		case errors.Is(err, store.ErrObservationTitleRequired),
-			errors.Is(err, store.ErrObservationContentRequired):
+		case errors.Is(err, store.ErrExpectedProjectRequired),
+			errors.Is(err, store.ErrObservationTitleRequired),
+			errors.Is(err, store.ErrObservationContentRequired),
+			errors.Is(err, store.ErrObservationFindReplacePairRequired),
+			errors.Is(err, store.ErrObservationFindReplaceContentConflict),
+			errors.Is(err, store.ErrObservationFindReplaceInputTooLarge),
+			errors.Is(err, store.ErrObservationFindReplaceResultTooLarge),
+			errors.Is(err, store.ErrObservationFindReplaceLegacyContentLarge):
 			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrObservationProjectMismatch),
+			errors.Is(err, store.ErrObservationProjectImmutable):
+			jsonError(w, http.StatusConflict, err.Error())
 		default:
 			jsonError(w, http.StatusNotFound, err.Error())
 		}
@@ -725,6 +822,76 @@ func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request)
 
 	s.notifyWrite()
 	jsonResponse(w, http.StatusOK, obs)
+}
+
+func (s *Server) handlePinObservation(w http.ResponseWriter, r *http.Request) {
+	s.handleObservationPinState(w, r, true)
+}
+
+func (s *Server) handleUnpinObservation(w http.ResponseWriter, r *http.Request) {
+	s.handleObservationPinState(w, r, false)
+}
+
+func (s *Server) handleObservationPinState(w http.ResponseWriter, r *http.Request, pinned bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		jsonError(w, http.StatusBadRequest, "invalid observation id")
+		return
+	}
+
+	setPinned := s.store.UnpinObservation
+	if pinned {
+		setPinned = s.store.PinObservation
+	}
+	if err := setPinned(id); err != nil {
+		if errors.Is(err, store.ErrObservationNotFound) {
+			jsonError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"id":     id,
+		"pinned": pinned,
+	})
+}
+
+func (s *Server) handleSuggestTopicKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Type    string `json:"type"`
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&body); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, http.StatusBadRequest, "request body too large")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, http.StatusBadRequest, "request body too large")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, "invalid json: trailing data")
+		return
+	}
+	if strings.TrimSpace(body.Title) == "" && strings.TrimSpace(body.Content) == "" {
+		jsonError(w, http.StatusBadRequest, "provide title or content to suggest a topic_key")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{
+		"topic_key": store.SuggestTopicKey(body.Type, body.Title, body.Content),
+	})
 }
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request) {
@@ -736,8 +903,12 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request)
 	}
 
 	hard := queryBool(r, "hard", false)
-	if err := s.store.DeleteObservation(id, hard); err != nil {
+	if err := s.store.DeleteObservationForProject(id, r.URL.Query().Get("expected_project"), hard); err != nil {
 		switch {
+		case errors.Is(err, store.ErrExpectedProjectRequired):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrObservationProjectMismatch):
+			jsonError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, store.ErrObservationNotFound):
 			jsonError(w, http.StatusNotFound, err.Error())
 		default:
@@ -910,11 +1081,13 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id, err := s.store.AddPrompt(body)
+	id, inserted, err := s.store.AddPromptWithResult(body)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrPromptContentRequired):
 			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrPromptInboxDeleted):
+			jsonError(w, http.StatusConflict, err.Error())
 		case writeOwnershipError(w, body.SessionID, err):
 		default:
 			jsonError(w, http.StatusInternalServerError, err.Error())
@@ -922,7 +1095,9 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.notifyWrite()
+	if inserted {
+		s.notifyWrite()
+	}
 	jsonResponse(w, http.StatusCreated, map[string]any{"id": id, "status": "saved"})
 }
 
@@ -1103,6 +1278,31 @@ func clampContextBytes(v int) int {
 	return v
 }
 
+// contextBytesQuery caps positive decimal budgets before converting to int,
+// including values beyond the native integer range.
+func contextBytesQuery(r *http.Request) int {
+	v := r.URL.Query().Get("max_bytes")
+	if v == "" {
+		return 0
+	}
+	if v[0] == '+' {
+		v = v[1:]
+	}
+	if v == "" {
+		return 0
+	}
+	budget := 0
+	for _, digit := range v {
+		if digit < '0' || digit > '9' {
+			return 0
+		}
+		if budget <= contextMaxBytes {
+			budget = budget*10 + int(digit-'0')
+		}
+	}
+	return clampContextBytes(budget)
+}
+
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
 	if err != nil {
@@ -1121,7 +1321,7 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	// clampContextLimit only puts a ceiling on the >0 state; 0 and negatives
 	// pass through untouched so all three states survive.
 	opts := store.ContextOptions{
-		MaxBytes:     clampContextBytes(queryInt(r, "max_bytes", 0)),
+		MaxBytes:     contextBytesQuery(r),
 		Observations: clampContextLimit(queryInt(r, "observations", 0)),
 		Prompts:      clampContextLimit(queryInt(r, "prompts", 0)),
 		Sessions:     clampContextLimit(queryInt(r, "sessions", 0)),
@@ -1158,9 +1358,45 @@ func (s *Server) handleCompactionContext(w http.ResponseWriter, r *http.Request)
 	jsonResponse(w, http.StatusOK, map[string]string{"context": context})
 }
 
+// handleListProjects serves the HTTP view of mem_list_projects (engram#675),
+// backed by the same store query as the MCP tool and `engram projects list` so
+// CLI, MCP, and HTTP never diverge. An empty store is a successful empty listing.
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.store.ListProjectsWithStats()
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if projects == nil {
+		projects = []store.ProjectStats{}
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"projects": projects,
+		"count":    len(projects),
+	})
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
 	if err != nil {
+		var unknown *projectpkg.UnknownProjectError
+		if errors.As(err, &unknown) {
+			// The available-project lookup can fail independently of resolution.
+			available, listErr := s.store.ListProjectNames()
+			if listErr != nil {
+				jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
+				return
+			}
+			jsonErrorWithFields(w, http.StatusNotFound, fmt.Sprintf("project %q not found", unknown.Name), map[string]any{
+				"code": "unknown_project", "available_projects": available,
+			})
+			return
+		}
+		var transition *projectpkg.ProjectTransitionError
+		if !errors.Is(err, projectpkg.ErrInvalidProjectName) && !errors.Is(err, projectpkg.ErrAmbiguousProject) && !errors.As(err, &transition) {
+			jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
+			return
+		}
 		s.writeProjectResolutionError(w, resolved, err)
 		return
 	}
@@ -1171,7 +1407,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats, err = loadServerStats(s.store)
 	}
 	if err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		jsonError(w, http.StatusInternalServerError, "stats unavailable")
 		return
 	}
 
@@ -1179,7 +1415,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
-	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	resolved, err := s.resolveRequestProjectWithDetector(r, projectpkg.ResolutionCurrent, true, s.store.InspectProject)
 	if err != nil {
 		s.writeProjectResolutionError(w, resolved, err)
 		return
@@ -1217,6 +1453,7 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	res, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
 		Mode:      projectpkg.ResolutionCurrent,
 		Directory: cwd,
+		Detect:    s.store.DetectProject,
 	})
 	if err != nil && !errors.Is(err, projectpkg.ErrAmbiguousProject) {
 		s.writeProjectResolutionError(w, res, err)
@@ -1243,6 +1480,10 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 // Current-project reads require known explicit/process overrides, while cwd
 // detection remains usable before a project has any stored memories.
 func (s *Server) resolveRequestProject(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool) (projectpkg.DetectionResult, error) {
+	return s.resolveRequestProjectWithDetector(r, mode, requireKnownOverrides, s.store.DetectProject)
+}
+
+func (s *Server) resolveRequestProjectWithDetector(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool, detect func(string) projectpkg.DetectionResult) (projectpkg.DetectionResult, error) {
 	query := r.URL.Query()
 	projectValues, projectProvided := query["project"]
 	if projectProvided {
@@ -1270,6 +1511,7 @@ func (s *Server) resolveRequestProject(r *http.Request, mode projectpkg.Resoluti
 		Explicit:             query.Get("project"),
 		Directory:            query.Get("cwd"),
 		ProjectExists:        s.store.ProjectExists,
+		Detect:               detect,
 		RequireKnownExplicit: requireKnownOverrides,
 		RequireKnownProcess:  requireKnownOverrides,
 	})
@@ -1301,7 +1543,16 @@ func (s *Server) writeProjectResolutionError(w http.ResponseWriter, res projectp
 		code = "ambiguous_project"
 		status = http.StatusConflict
 	}
+	var transition *projectpkg.ProjectTransitionError
+	if errors.As(err, &transition) {
+		code = "project_transition_conflict"
+		status = http.StatusConflict
+	}
 	fields := map[string]any{"code": code}
+	if transition != nil {
+		fields["candidate_project"] = transition.Candidate
+		fields["available_projects"] = res.AvailableProjects
+	}
 	if errors.Is(err, projectpkg.ErrAmbiguousProject) {
 		fields["available_projects"] = res.AvailableProjects
 		fields["project_source"] = res.Source
@@ -1595,6 +1846,7 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		Explicit:             body.Project,
 		Directory:            r.URL.Query().Get("cwd"),
 		ProjectExists:        s.store.ProjectExists,
+		Detect:               s.store.DetectProject,
 		RequireKnownExplicit: true,
 		RequireKnownProcess:  true,
 	})

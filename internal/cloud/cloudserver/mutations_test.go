@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 )
 
 // ─── Fakes for mutation tests ─────────────────────────────────────────────────
@@ -182,6 +182,38 @@ func (s *fakeMutationStore) InsertMutationBatch(ctx context.Context, batch []Mut
 		s.mutations = append(s.mutations, batch[i])
 	}
 	return seqs, nil
+}
+
+func TestMutationPushRejectsNonUTF8PayloadWithoutStorage(t *testing.T) {
+	ms := newFakeMutationStore()
+	srv := newMutationTestServer(ms, "secret", []string{"proj-a"})
+	body := []byte(`{"entries":[{"project":"proj-a","entity":"observation","entity_key":"obs-invalid","op":"upsert","payload":{"sync_id":"obs-invalid","session_id":"sess-1","type":"note","title":"Invalid","content":"`)
+	body = append(body, 0xff)
+	body = append(body, []byte(`","scope":"project"}}]}`)...)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync/mutations/push", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		ErrorClass string `json:"error_class"`
+		ErrorCode  string `json:"error_code"`
+		ReasonCode string `json:"reason_code"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode rejection response: %v", err)
+	}
+	if response.ErrorClass != "repairable" || response.ErrorCode != "upgrade_repairable_payload_invalid" || response.ReasonCode != "validation_error" {
+		t.Fatalf("expected actionable payload validation error, got %+v", response)
+	}
+	if len(ms.mutations) != 0 {
+		t.Fatalf("expected no stored mutations, got %+v", ms.mutations)
+	}
 }
 
 func TestMutationPushStoresCanonicalEncodedPayload(t *testing.T) {
@@ -451,6 +483,65 @@ func TestMutationPushEndpointAccepted(t *testing.T) {
 	}
 	if len(resp.AcceptedSeqs) != 5 {
 		t.Fatalf("expected 5 accepted_seqs, got %d", len(resp.AcceptedSeqs))
+	}
+}
+
+func TestMutationPushInsertFailureLogsBoundedSafeIdentityWithoutAudit(t *testing.T) {
+	const (
+		payloadSecret = "payload-secret-must-not-appear"
+		tokenSecret   = "token-secret-must-not-appear"
+		causeSecret   = "raw-cause-secret-must-not-appear"
+	)
+	entityKey := "safe-✓\n\t" + strings.Repeat("x", 80) + "not-retained"
+	ms := newFakeMutationStore()
+	ms.errInsert = &cloudstore.MutationBatchEntryError{
+		BatchIndex: 0,
+		Entity:     "observation",
+		EntityKey:  entityKey,
+		Err:        fmt.Errorf("database failure: %s", causeSecret),
+	}
+	srv := newMutationTestServer(ms, tokenSecret, []string{"proj-a"})
+
+	var logs bytes.Buffer
+	entries := []MutationEntry{{
+		Project:   "proj-a",
+		Entity:    "observation",
+		EntityKey: "safe-record",
+		Op:        "upsert",
+		Payload:   json.RawMessage(`{"title":"payload-secret-must-not-appear"}`),
+	}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync/mutations/push", marshalPushRequest(t, entries))
+	req = req.WithContext(context.WithValue(req.Context(), mutationPushLogWriterContextKey{}, &logs))
+	req.Header.Set("Authorization", "Bearer "+tokenSecret)
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if len(ms.auditCalls) != 0 {
+		t.Fatalf("expected no audit rows for insert failure, got %+v", ms.auditCalls)
+	}
+	output := logs.String()
+	if count := strings.Count(output, "mutation push rejected"); count != 1 {
+		t.Fatalf("expected exactly one rejection log, got %d logs=%q", count, output)
+	}
+	for _, want := range []string{"batch_index=0", `entity="observation"`, `entity_key="safe-✓\n\t`} {
+		if !strings.Contains(output, want) {
+			t.Errorf("rejection log = %q, want %q", output, want)
+		}
+	}
+	if strings.Count(output, "\n") != 1 {
+		t.Errorf("rejection log contains an injected physical line: %q", output)
+	}
+	for _, forbidden := range []string{payloadSecret, tokenSecret, causeSecret, "not-retained"} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("rejection log exposes %q: %q", forbidden, output)
+		}
+		if strings.Contains(rec.Body.String(), forbidden) {
+			t.Errorf("500 response exposes %q: %q", forbidden, rec.Body.String())
+		}
 	}
 }
 

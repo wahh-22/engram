@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/llm"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/llm"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 // cmdConflicts is the top-level dispatcher for `engram conflicts <subcommand>`.
@@ -263,14 +263,16 @@ func cmdConflictsStats(cfg store.Config) {
 		fmt.Println("  No relations found.")
 	} else {
 		fmt.Println("  By judgment_status:")
-		// Print in a stable order: pending, accepted, rejected, then others.
-		for _, status := range []string{"pending", "accepted", "rejected"} {
+		// Print in a stable order: pending, accepted, rejected, orphaned, then
+		// others. Orphaned gets an explicit label so the audited disposition is
+		// visible deterministically when > 0.
+		for _, status := range []string{"pending", "accepted", "rejected", "orphaned"} {
 			if n, ok := stats.ByJudgmentStatus[status]; ok {
 				fmt.Printf("    %-12s %d\n", status+":", n)
 			}
 		}
 		for status, n := range stats.ByJudgmentStatus {
-			if status != "pending" && status != "accepted" && status != "rejected" {
+			if status != "pending" && status != "accepted" && status != "rejected" && status != "orphaned" {
 				fmt.Printf("    %-12s %d\n", status+":", n)
 			}
 		}
@@ -296,7 +298,7 @@ func cmdConflictsScan(cfg store.Config) {
 
 	var projectFlag, sinceFlag string
 	allProjects := false
-	dryRun := true // default
+	dryRunFlag := false // Tracks explicit --dry-run; apply=false preserves the default.
 	apply := false
 	maxInsert := 100
 	limit := 0
@@ -324,11 +326,9 @@ func cmdConflictsScan(cfg store.Config) {
 				i++
 			}
 		case "--dry-run":
-			dryRun = true
-			apply = false
+			dryRunFlag = true
 		case "--apply":
 			apply = true
-			dryRun = false
 		case "--max-insert":
 			if i+1 < len(args) {
 				if n, err := strconv.Atoi(args[i+1]); err == nil {
@@ -393,7 +393,7 @@ func cmdConflictsScan(cfg store.Config) {
 	}
 
 	// Explicit mutex enforcement
-	if dryRun && apply {
+	if dryRunFlag && apply {
 		fmt.Fprintln(os.Stderr, "error: --dry-run and --apply are mutually exclusive")
 		exitFunc(1)
 		return

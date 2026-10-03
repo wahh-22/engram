@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { createServer as createHTTPServer } from "node:http";
 import { createServer } from "node:net";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -24,27 +24,44 @@ function freePort() {
 
 // A fake `engram serve` that logs every invocation, then either dies before readiness or
 // starts answering /health after `readyAfterMs` — the slow-health window under test.
-async function writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs, exitCode }) {
+// `instanceId: "fail"` models a pre-rc.11 binary whose `instance-id` command exits 1, and
+// `cliVersion` gives the `version` probe something to report.
+async function writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs, exitCode, instanceId = "ok", cliVersion }) {
   const binPath = join(dir, "fake-engram.cjs");
+  const instanceIdHandler = instanceId === "fail"
+    ? `if (command === "instance-id" || command === resolve("instance-id")) { process.stderr.write("Error: unknown command \\"instance-id\\" for \\"engram\\"\\n"); process.exit(1); }`
+    : `if (command === "instance-id" || command === resolve("instance-id")) { process.stdout.write("00000000000000000000000000000000\\n"); process.exit(0); }`;
+  const versionHandler = cliVersion === undefined
+    ? ""
+    : `if (command === "version" || command === resolve("version")) { process.stdout.write(${JSON.stringify(cliVersion)} + "\\n"); process.exit(0); }`;
   const script = `#!/usr/bin/env node
 const { appendFileSync } = require("node:fs");
 const { createServer } = require("node:http");
 const { resolve } = require("node:path");
 
 const syntheticServePath = resolve("serve");
-const isSyntheticServe = process.argv[1] === syntheticServePath;
+const command = process.argv.at(-1); const isSyntheticServe = command === "serve" || command === syntheticServePath; ${instanceIdHandler} ${versionHandler}
+if (process.argv.includes("sync") || process.argv.includes("--import")) { appendFileSync(${JSON.stringify(spawnLog)}, "sync --import\\n"); process.exit(0); }
 const isServe = process.argv[2] === "serve" || isSyntheticServe;
 if (isServe) {
   appendFileSync(${JSON.stringify(spawnLog)}, "serve\\n");
+  appendFileSync(${JSON.stringify(spawnLog)}, "autosync=" + (process.env.ENGRAM_CLOUD_AUTOSYNC ?? "<unset>") + "\\n");
   ${exitCode === undefined
-      ? `const server = createServer((req, res) => {
+      ? `const server = createServer(async (req, res) => {
+  if (req.url === "/sessions") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+    return;
+  }
   if (req.url.startsWith("/project/current")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ project: "fake-project" }));
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  res.end("{}");
+  res.end(JSON.stringify({ instance_id: "00000000000000000000000000000000" }));
 });
 // The port was picked by a probe socket that has since closed, so another process can win it
 // in between. Retry the bind for a bounded window instead of dying on a lost race.
@@ -114,9 +131,17 @@ async function withFixture(options, run) {
     const spawnLog = join(dir, "spawns.log");
     await writeFile(spawnLog, "", "utf8");
     const port = await freePort();
-    readyServer = options.readyServer && createHTTPServer((request, response) => {
+    readyServer = options.readyServer && createHTTPServer(async (request, response) => {
+      options.requests?.push({ method: request.method, url: request.url });
+      if (request.url === "/sessions") {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+        return;
+      }
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : {}));
+      response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? { instance_id: "00000000000000000000000000000000" })));
     });
     if (readyServer) await new Promise((resolve, reject) => {
       readyServer.once("error", reject);
@@ -127,13 +152,13 @@ async function withFixture(options, run) {
     });
     const fakeEngram = options.missingBin
       ? { engramBin: join(dir, "engram-does-not-exist") }
-      : await writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs: options.readyAfterMs ?? 0, exitCode: options.exitCode });
+      : await writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs: options.readyAfterMs ?? 0, exitCode: options.exitCode, instanceId: options.instanceId, cliVersion: options.cliVersion });
     if (fakeEngram.nodeOptions) {
       process.env.NODE_OPTIONS = [originalNodeOptions, fakeEngram.nodeOptions].filter(Boolean).join(" ");
     }
     const sandbox = await createPluginSandbox(dir);
     const plugin = await loadPlugin({ engramBin: fakeEngram.engramBin, port, cwd: dir, sandbox });
-    await run({ ...plugin, spawnLog, dir, port });
+    await run({ ...plugin, spawnLog, dir, port, stopServer: () => new Promise((resolve) => readyServer.close(resolve)) });
   } finally {
     if (originalBin === undefined) delete process.env.ENGRAM_BIN; else process.env.ENGRAM_BIN = originalBin;
     if (originalPort === undefined) delete process.env.ENGRAM_PORT; else process.env.ENGRAM_PORT = originalPort;
@@ -144,10 +169,130 @@ async function withFixture(options, run) {
   }
 }
 
+for (const replacement of ["retry", "recovery"]) {
+  test(`satellite transport validates replacement capability on ${replacement}`, async () => {
+    await withFixture({ readyServer: true }, async ({ hooks, tools, ctx }) => {
+      await hooks.get("session_start")({}, ctx);
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      let unsafePosts = 0;
+      let recoveryProbes = 0;
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/health") {
+          if (attempts >= 2) recoveryProbes++;
+          return new Response(JSON.stringify({ instance_id: "00000000000000000000000000000000",
+            capabilities: { isolated_session_registration: attempts < (replacement === "retry" ? 1 : 2) } }));
+        }
+        if (path === "/sessions") {
+          attempts++;
+          if (replacement === "retry" ? attempts === 1 : attempts <= 2) {
+            throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+          }
+          unsafePosts++;
+          return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }), { status: 201 });
+        }
+        if (path === "/observations") return new Response('{"id":1}', { status: 201 });
+        return originalFetch(url, init);
+      };
+      try {
+        const result = await tools.get("mem_save").execute("replacement", { title: "t", content: "c", project: "foreign-project" }, undefined, undefined, ctx);
+        assert.equal(result.isError, true, JSON.stringify(result));
+        assert.match(result.content[0].text, /upgrade[\s\S]*isolated_session_registration/i);
+        assert.equal(unsafePosts, 0, "replacement must never receive satellite POST");
+        if (replacement === "recovery") assert.ok(recoveryProbes > 0, "fixture must exercise the recovery probe");
+      } finally { globalThis.fetch = originalFetch; }
+    });
+  });
+}
+
+for (const staysOffline of [false, true]) {
+  test(`capable satellite recovery is bounded (offline=${staysOffline})`, async () => {
+    await withFixture({ readyServer: true }, async ({ hooks, tools, ctx }) => {
+      await hooks.get("session_start")({}, ctx);
+      const originalFetch = globalThis.fetch;
+      let posts = 0;
+      let writes = 0;
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/health") return new Response(JSON.stringify({ instance_id: "00000000000000000000000000000000", capabilities: { isolated_session_registration: true } }));
+        if (path === "/sessions") {
+          posts++;
+          if (staysOffline || posts <= 2) throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+          return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }), { status: 201 });
+        }
+        if (path === "/observations") { writes++; return new Response('{"id":1}', { status: 201 }); }
+        return originalFetch(url, init);
+      };
+      try {
+        const result = await tools.get("mem_save").execute("recovery", { title: "t", content: "c", project: "foreign-project" }, undefined, undefined, ctx);
+        assert.equal(result.isError, staysOffline ? true : undefined, JSON.stringify(result));
+        assert.equal(posts, staysOffline ? 4 : 3, "only one bounded recovery replay");
+        assert.equal(writes, staysOffline ? 0 : 1);
+      } finally { globalThis.fetch = originalFetch; }
+    });
+  });
+}
+
+test("manifest presence never triggers import while startup still detects the project", async () => {
+  for (const manifestPresent of [true, false]) {
+    await withFixture({ readyServer: true }, async ({ hooks, ctx, dir, spawnLog, statusCalls }) => {
+      if (manifestPresent) {
+        await mkdir(join(dir, ".engram"));
+        await writeFile(join(dir, ".engram", "manifest.json"), "{}", "utf8");
+      }
+      await hooks.get("session_start")({}, ctx);
+      assert.deepEqual(statusCalls, [["engram", "🧠 fake-project · ready"]]);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(await readFile(spawnLog, "utf8"), "",
+        `startup with manifestPresent=${manifestPresent} must not spawn sync --import`);
+    });
+  }
+});
+
 async function countSpawns(spawnLog) {
   const log = await readFile(spawnLog, "utf8");
   return log.split("\n").filter((line) => line === "serve").length;
 }
+
+test("reload shutdown preserves the live session for its same-ID successor", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, requests }, async ({ hooks, ctx }) => {
+    await hooks.get("session_start")({}, ctx);
+    await hooks.get("before_agent_start")({ systemPrompt: "", prompt: "A prompt long enough to register" }, ctx);
+    await hooks.get("session_shutdown")({ reason: "reload" }, ctx);
+    await hooks.get("session_start")({ reason: "reload" }, ctx);
+    await hooks.get("before_agent_start")({ systemPrompt: "", prompt: "A second prompt long enough to register" }, ctx);
+    assert.equal(requests.filter(({ url }) => url === "/sessions/session-startup/end").length, 0);
+    await hooks.get("session_shutdown")({ reason: "quit" }, ctx);
+    assert.equal(requests.filter(({ url }) => url === "/sessions/session-startup/end").length, 1);
+  });
+});
+
+test("reload shutdown does not try terminal delivery after a registered session goes offline", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, exitCode: 1, requests }, async ({ hooks, ctx, stopServer }) => {
+    await hooks.get("session_start")({}, ctx);
+    await hooks.get("before_agent_start")({ systemPrompt: "", prompt: "A prompt long enough to register" }, ctx);
+    assert.equal(requests.filter(({ method, url }) => method === "POST" && url === "/sessions").length, 1,
+      "the session must be registered before the server goes offline");
+    await stopServer();
+
+    const originalFetch = globalThis.fetch;
+    const attemptedEnds = [];
+    globalThis.fetch = (input, init) => {
+      if (String(input).endsWith("/sessions/session-startup/end")) attemptedEnds.push(init);
+      return originalFetch(input, init);
+    };
+    try {
+      await assert.doesNotReject(hooks.get("session_shutdown")({ reason: "reload" }, ctx));
+      assert.equal(attemptedEnds.length, 0);
+      await assert.doesNotReject(hooks.get("session_start")({ reason: "reload" }, ctx));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
 
 test("an initially healthy Engram provider publishes ready status", async () => {
   await withFixture({ readyServer: true }, async ({ hooks, ctx, statusCalls }) => {
@@ -181,6 +326,24 @@ test("a slow health probe never authorizes a duplicate spawn", async () => {
   });
 });
 
+test("a plugin-launched server starts with cloud autosync enabled", async () => {
+  const previous = process.env.ENGRAM_CLOUD_AUTOSYNC;
+  delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+  try {
+    await withFixture({ readyAfterMs: 0 }, async ({ hooks, ctx, spawnLog }) => {
+      await hooks.get("session_start")({}, ctx);
+
+      assert.equal(await countSpawns(spawnLog), 1, "the plugin spawns the server");
+      const log = await readFile(spawnLog, "utf8");
+      assert.ok(log.split("\n").includes("autosync=1"),
+        "the daemon must opt into cloud autosync, like the Claude Code and Codex launchers");
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+    else process.env.ENGRAM_CLOUD_AUTOSYNC = previous;
+  }
+});
+
 test("a child that exits before readiness surfaces a normalized tool error", async () => {
   await withFixture({ exitCode: 1 }, async ({ tools, ctx }) => {
     const memSearch = tools.get("mem_search");
@@ -201,6 +364,11 @@ test("a child that exits before readiness never escapes the session hooks", asyn
 
     const result = await hooks.get("before_agent_start")({ systemPrompt: "base", prompt: "hello there" }, ctx);
     assert.match(result.systemPrompt, /^base\n\n/, "memory instructions still reach the agent");
+
+    const options = { appendSystemPrompt: "existing" };
+    const structured = await hooks.get("before_agent_start")({ systemPrompt: "base", systemPromptOptions: options, prompt: "hello there" }, ctx);
+    assert.equal(structured, undefined, "structured options never receive a forced replacement");
+    assert.match(options.appendSystemPrompt, /^existing\n\n## Engram Persistent Memory — Protocol/);
   });
 });
 
@@ -248,6 +416,168 @@ test("a persistently failing provider does not restart Engram on every tool call
     assert.ok(spawns >= 1, "the first call still attempts a real startup");
     assert.ok(spawns <= 2, `50 failing tool calls produced ${spawns} startup attempts, not a bounded retry`);
   });
+});
+
+test("a pre-v2 server on the port fails closed with legacy guidance and never spawns", async () => {
+  await withFixture({
+    readyServer: true,
+    healthBody: { status: "ok", service: "engram", version: "1.20.0" },
+    cliVersion: "1.20.0",
+  }, async ({ tools, ctx, spawnLog }) => {
+    const memSearch = tools.get("mem_search");
+    const result = await memSearch.execute("call-legacy", { query: "startup" }, undefined, undefined, ctx);
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /predates instance identity \(server 1\.20\.0, CLI 1\.20\.0\)/);
+    assert.match(result.content[0].text, /stop it and start the current binary/);
+    assert.match(result.content[0].text, /Nothing is terminated automatically and memory retries on its own/);
+    assert.match(result.content[0].text, /treat this port as occupied by an unrelated process/);
+    assert.equal(await countSpawns(spawnLog), 0, "a legacy server is never adopted, terminated, or replaced");
+  });
+});
+
+test("a pre-identity release candidate on the port fails closed with legacy guidance", async () => {
+  await withFixture({
+    readyServer: true,
+    healthBody: { status: "ok", service: "engram", version: "2.0.0-rc.10" },
+    cliVersion: "2.0.0-rc.10",
+  }, async ({ tools, ctx, spawnLog }) => {
+    const result = await tools.get("mem_search").execute("call-legacy-rc", { query: "startup" }, undefined, undefined, ctx);
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /predates instance identity \(server 2\.0\.0-rc\.10, CLI 2\.0\.0-rc\.10\)/);
+    assert.equal(await countSpawns(spawnLog), 0, "a legacy server is never adopted, terminated, or replaced");
+  });
+});
+
+test("current and later servers without instance identity fail closed without legacy guidance", async () => {
+  for (const version of ["2.0.0-rc.11", "2.0.0", "2.1.0"]) {
+    await withFixture({
+      readyServer: true,
+      healthBody: { status: "ok", service: "engram", version },
+      cliVersion: version,
+    }, async ({ tools, ctx, spawnLog }) => {
+      const result = await tools.get("mem_search").execute(`call-missing-identity-${version}`, { query: "startup" }, undefined, undefined, ctx);
+
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /did not report its instance identity/);
+      assert.match(result.content[0].text, /not proven older than v2\.0\.0-rc\.11/);
+      assert.doesNotMatch(result.content[0].text, /predates instance identity/);
+      assert.equal(await countSpawns(spawnLog), 0, "an identity-incompatible server is never adopted, terminated, or replaced");
+    });
+  }
+});
+
+test("unknown, absent, and malformed versions without instance identity fail closed", async () => {
+  for (const version of [undefined, "unknown", "2.0", "current"]) {
+    await withFixture({
+      readyServer: true,
+      healthBody: { status: "ok", service: "engram", ...(version === undefined ? {} : { version }) },
+    }, async ({ tools, ctx, spawnLog }) => {
+      const result = await tools.get("mem_search").execute(`call-unrecognized-version-${version ?? "absent"}`, { query: "startup" }, undefined, undefined, ctx);
+
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /did not report its instance identity/);
+      assert.match(result.content[0].text, /not proven older than v2\.0\.0-rc\.11/);
+      assert.doesNotMatch(result.content[0].text, /predates instance identity/);
+      assert.doesNotMatch(result.content[0].text, /unrelated process/);
+      assert.equal(await countSpawns(spawnLog), 0, "an unverified server is never adopted, terminated, or replaced");
+    });
+  }
+});
+
+test("a pre-rc.11 binary surfaces the upgrade guidance instead of a generic identity error", async () => {
+  await withFixture({ instanceId: "fail" }, async ({ tools, ctx }) => {
+    const result = await tools.get("mem_search").execute("call-oldcli", { query: "startup" }, undefined, undefined, ctx);
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /does not support "instance-id" and predates v2\.0\.0-rc\.11/);
+    assert.match(result.content[0].text, /Upgrade the binary, or point ENGRAM_BIN at the current one/);
+  });
+});
+
+test("a missing binary is reported as not found, not as an outdated version", async () => {
+  await withFixture({ missingBin: true }, async ({ tools, ctx }) => {
+    const result = await tools.get("mem_save").execute("call-noent", { content: "x" }, undefined, undefined, ctx);
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /could not be found/);
+    assert.doesNotMatch(result.content[0].text, /predates v2\.0\.0-rc\.11/);
+  });
+});
+
+test("a foreign server retains actionable evidence and doctor diagnoses locally", async () => {
+  const requests = [];
+  await withFixture({
+    readyServer: true,
+    healthBody: { status: "ok", service: "engram", version: "2.0.0", instance_id: "ffffffffffffffffffffffffffffffff" },
+    cliVersion: "2.0.0",
+    requests,
+  }, async ({ tools, ctx, spawnLog }) => {
+    const result = await tools.get("mem_search").execute("call-foreign", { query: "startup" }, undefined, undefined, ctx);
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /ownership mismatch/);
+    assert.match(result.content[0].text, /local ID 00000000000000000000000000000000/);
+    assert.match(result.content[0].text, /remote ID ffffffffffffffffffffffffffffffff/);
+    assert.match(result.content[0].text, /local version 2\.0\.0, remote version 2\.0\.0/);
+    assert.match(result.content[0].text, /WSL2.*possible cause/);
+    assert.match(result.content[0].text, /ENGRAM_PORT=<port>/);
+    const beforeDoctor = requests.length;
+    const doctor = await tools.get("mem_doctor").execute("doctor", {}, undefined, undefined, ctx);
+    assert.equal(doctor.isError, true);
+    assert.equal(doctor.details.data.source, "LOCAL");
+    assert.equal(doctor.details.data.code, "ownership_mismatch");
+    assert.deepEqual(doctor.details.data.evidence, {
+      localInstanceID: "00000000000000000000000000000000",
+      remoteInstanceID: "ffffffffffffffffffffffffffffffff",
+      localVersion: "2.0.0", remoteVersion: "2.0.0",
+    });
+    assert.equal(requests.length, beforeDoctor, "doctor uses cached failure, not a new probe");
+    assert.ok(requests.every(({ url }) => url === "/health"), "foreign endpoint receives no project, session, doctor or memory requests");
+    assert.equal(await countSpawns(spawnLog), 0, "a foreign server is never adopted, terminated, or replaced");
+  });
+});
+
+test("foreign doctor reports unavailable versions as unknown and honors cancellation", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, requests,
+    healthBody: { instance_id: "ffffffffffffffffffffffffffffffff" },
+  }, async ({ tools, ctx, spawnLog }) => {
+    const doctor = tools.get("mem_doctor");
+    const result = await doctor.execute("unknown", {}, undefined, undefined, ctx);
+    assert.equal(result.details.data.evidence.localVersion, "unknown");
+    assert.equal(result.details.data.evidence.remoteVersion, "unknown");
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(doctor.execute("cancelled", {}, controller.signal, undefined, ctx), /cancelled/);
+    assert.deepEqual(requests.map(({ url }) => url), ["/health"]);
+    assert.equal(await countSpawns(spawnLog), 0);
+  });
+});
+
+test("normal doctor still calls the server after project detection", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, requests }, async ({ tools, ctx }) => {
+    const result = await tools.get("mem_doctor").execute("normal", {}, undefined, undefined, ctx);
+    assert.equal(result.isError, undefined);
+    assert.ok(requests.some(({ url }) => url.startsWith("/project/current")));
+    assert.ok(requests.some(({ url }) => url.startsWith("/doctor?project=fake-project")));
+    assert.notEqual(result.details.data.source, "LOCAL");
+  });
+});
+
+test("doctor does not bypass unrelated deterministic initialization failures", async () => {
+  for (const healthBody of [{ version: "1.20.0" }, { version: "2.0.0" }, { version: "malformed", instance_id: null }]) {
+    const requests = [];
+    await withFixture({ readyServer: true, healthBody, requests }, async ({ tools, ctx, spawnLog }) => {
+      const result = await tools.get("mem_doctor").execute("unrelated", {}, undefined, undefined, ctx);
+      assert.equal(result.isError, true);
+      assert.equal(result.details.data, undefined, "no local ownership fallback for legacy/missing identity");
+      assert.deepEqual(requests.map(({ url }) => url), ["/health"]);
+      assert.equal(await countSpawns(spawnLog), 0);
+    });
+  }
 });
 
 test("loading the plugin leaves the checkout's node_modules untouched", async () => {

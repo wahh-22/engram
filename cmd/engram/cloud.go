@@ -10,16 +10,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudserver"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/constants"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/dashboard"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/remote"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloudconfig"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudserver"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/dashboard"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/remote"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloudconfig"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 )
 
 type cloudManifestReader interface {
@@ -225,12 +225,12 @@ var runUpgradeRemirror = func(s *store.Store, project string, cc *cloudconfig.Co
 func cmdCloud(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram cloud <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair, bootstrap")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, unenroll, config, serve, upgrade, repair, bootstrap, attest-prompt-source")
 		exitFunc(1)
 	}
 	if os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help" {
 		fmt.Println("usage: engram cloud <subcommand> [options]")
-		fmt.Println("supported subcommands: status, enroll, config, serve, upgrade, repair, bootstrap")
+		fmt.Println("supported subcommands: status, enroll, unenroll, config, serve, upgrade, repair, bootstrap, attest-prompt-source")
 		return
 	}
 
@@ -239,6 +239,8 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudStatus(cfg)
 	case "enroll":
 		cmdCloudEnroll(cfg)
+	case "unenroll":
+		cmdCloudUnenroll(cfg)
 	case "config":
 		cmdCloudConfig(cfg)
 	case "serve":
@@ -249,9 +251,11 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudRepair()
 	case "bootstrap":
 		cmdCloudBootstrap()
+	case "attest-prompt-source":
+		cmdCloudAttestPromptSource(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown cloud command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair, bootstrap")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, unenroll, config, serve, upgrade, repair, bootstrap, attest-prompt-source")
 		exitFunc(1)
 	}
 }
@@ -670,14 +674,29 @@ func hasCloudUpgradeFlag(args []string, flag string) bool {
 }
 
 func cmdCloudStatus(cfg store.Config) {
+	project, err := parseCloudStatusProjectArg(os.Args[3:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud status [--project <name>]")
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
 	cc, err := resolveCloudRuntimeConfig(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: unable to read cloud runtime config: %v\n", err)
 		exitFunc(1)
 		return
 	}
-	if cc == nil || cc.ServerURL == "" {
-		fmt.Println("Cloud status: not configured")
+	if cc == nil {
+		cc = &cloudconfig.Config{}
+	}
+	token := strings.TrimSpace(cc.Token)
+	_, tokenSource := cloudconfig.EffectiveToken(cfg.DataDir)
+	if cc.ServerURL == "" {
+		fmt.Println("Cloud status: not configured (no effective server URL)")
+		printCloudStatusAuth(token, tokenSource, false, false)
+		printCloudStatusProjectEnrollment(cfg, project)
+		printCloudStatusSyncDiagnostic(cfg, project)
 		return
 	}
 	validatedURL, err := cloudconfig.ValidateServerURL(cc.ServerURL)
@@ -687,33 +706,102 @@ func cmdCloudStatus(cfg store.Config) {
 		return
 	}
 	cc.ServerURL = validatedURL
-	token := strings.TrimSpace(cc.Token)
 	insecureNoAuth := envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
 	fmt.Printf("Cloud status: configured (target=%s)\n", constants.TargetKeyCloud)
 	fmt.Printf("Server: %s\n", cc.ServerURL)
+	if strings.TrimSpace(os.Getenv(cloudconfig.EnvCloudServer)) != "" {
+		fmt.Printf("Server source: %s\n", cloudconfig.EnvCloudServer)
+	} else {
+		fmt.Println("Server source: cloud.json")
+	}
+	printCloudStatusAuth(token, tokenSource, insecureNoAuth, true)
+	if insecureNoAuth {
+		fmt.Println("Warning: bearer auth is disabled in insecure mode; do not use in production")
+	}
+	if token == "" && !insecureNoAuth {
+		fmt.Println("Hint: if the remote server enforces bearer auth, set ENGRAM_CLOUD_TOKEN")
+	}
+	printCloudStatusProjectEnrollment(cfg, project)
+	printCloudStatusDaemonProbe()
+	printCloudStatusSyncDiagnostic(cfg, project)
+}
+
+func parseCloudStatusProjectArg(args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	if len(args) != 2 || strings.TrimSpace(args[0]) != "--project" {
+		return "", fmt.Errorf("--project <name> is the only supported status option")
+	}
+	project, warning := store.NormalizeProject(args[1])
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+	if strings.TrimSpace(project) == "" {
+		return "", fmt.Errorf("--project is required")
+	}
+	return project, nil
+}
+
+func printCloudStatusAuth(token string, source cloudconfig.Source, insecureNoAuth, serverConfigured bool) {
 	if token == "" {
 		if insecureNoAuth {
 			fmt.Println("Auth status: ready (insecure local-dev mode: ENGRAM_CLOUD_INSECURE_NO_AUTH=1)")
-			fmt.Println("Sync readiness: ready for explicit --project sync (project must be enrolled)")
-			fmt.Println("Warning: bearer auth is disabled in insecure mode; do not use in production")
-			printCloudStatusDaemonProbe()
-			printCloudStatusSyncDiagnostic(cfg)
-			return
+		} else {
+			fmt.Println("Auth status: token not configured (client token is optional at preflight)")
 		}
-		fmt.Println("Auth status: token not configured (client token is optional at preflight)")
-		fmt.Println("Sync readiness: ready to attempt explicit --project sync (project must be enrolled)")
-		fmt.Println("Hint: if the remote server enforces bearer auth, set ENGRAM_CLOUD_TOKEN")
-		printCloudStatusDaemonProbe()
-		printCloudStatusSyncDiagnostic(cfg)
+	} else if source == cloudconfig.SourceEnv {
+		fmt.Printf("Auth status: ready (token provided via %s)\n", cloudconfig.EnvCloudToken)
+	} else {
+		fmt.Println("Auth status: ready (token read from cloud.json)")
+	}
+	if !serverConfigured {
+		fmt.Println("Sync readiness: blocked (no effective server URL)")
 		return
 	}
-	fmt.Println("Auth status: ready (token provided via runtime cloud config)")
+	if token == "" && !insecureNoAuth {
+		fmt.Println("Sync readiness: ready to attempt explicit --project sync (project must be enrolled)")
+		return
+	}
 	fmt.Println("Sync readiness: ready for explicit --project sync (project must be enrolled)")
-	printCloudStatusDaemonProbe()
-	printCloudStatusSyncDiagnostic(cfg)
 }
 
-func printCloudStatusSyncDiagnostic(cfg store.Config) {
+func printCloudStatusProjectEnrollment(cfg store.Config, project string) {
+	if project == "" {
+		fmt.Println("Project enrollment: not checked (use --project <name>)")
+		return
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("Project enrollment: unavailable (%s has not been initialized)\n", cfg.DataDir)
+			return
+		}
+		fmt.Printf("Project enrollment: unavailable (%v)\n", err)
+		return
+	}
+	s, err := storeNew(cfg)
+	if err != nil {
+		fmt.Printf("Project enrollment: unavailable (%v)\n", err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		fmt.Printf("Project enrollment: unavailable (%v)\n", err)
+		return
+	}
+	if enrolled {
+		fmt.Printf("Project enrollment: enrolled (%s)\n", project)
+		return
+	}
+	fmt.Printf("Project enrollment: not enrolled (%s)\n", project)
+}
+
+func printCloudStatusSyncDiagnostic(cfg store.Config, projects ...string) {
+	project := ""
+	if len(projects) > 0 {
+		project = projects[0]
+	}
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); err != nil {
 		return
 	}
@@ -723,6 +811,22 @@ func printCloudStatusSyncDiagnostic(cfg store.Config) {
 		return
 	}
 	defer s.Close()
+	if project != "" {
+		state, err := s.GetSyncState(cloudTargetKeyForProject(project))
+		if err != nil || state == nil {
+			return
+		}
+		message := strings.TrimSpace(derefString(state.LastError))
+		if message == "" {
+			return
+		}
+		fmt.Println("Sync diagnostic: project-scoped cloud state")
+		if code := strings.TrimSpace(derefString(state.ReasonCode)); code != "" {
+			fmt.Printf("reason_code: %s\n", code)
+		}
+		fmt.Printf("reason_message: %s\n", message)
+		return
+	}
 	summary, err := s.CloudSyncSummary()
 	if err != nil {
 		return
@@ -751,21 +855,58 @@ func printCloudStatusSyncDiagnostic(cfg store.Config) {
 	}
 }
 
-func cmdCloudEnroll(cfg store.Config) {
-	if len(os.Args) >= 4 {
-		arg := strings.TrimSpace(os.Args[3])
+func parseCloudProjectArgs(command string) (string, bool, bool, error) {
+	for _, arg := range os.Args[3:] {
+		if arg == "--" {
+			break
+		}
 		if arg == "--help" || arg == "-h" || arg == "help" {
-			fmt.Println("usage: engram cloud enroll <project>")
-			fmt.Println("Enroll a local-first project for explicit cloud replication.")
-			return
+			fmt.Printf("usage: engram cloud %s <project> [--literal-project]\n", command)
+			if command == "enroll" {
+				fmt.Println("Enroll a local-first project for explicit cloud replication.")
+			} else {
+				fmt.Println("Stop future cloud replication for a project without deleting local or remote data.")
+			}
+			fmt.Println("--literal-project skips URL decoding; project normalization still applies.")
+			return "", false, true, nil
 		}
 	}
-	if len(os.Args) < 4 || strings.TrimSpace(os.Args[3]) == "" {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud enroll <project>")
-		exitFunc(1)
+	project, literal := "", false
+	positional := false
+	for _, arg := range os.Args[3:] {
+		if !positional && arg == "--" {
+			positional = true
+			continue
+		}
+		if !positional && arg == "--literal-project" {
+			literal = true
+		} else if !positional && strings.HasPrefix(arg, "-") {
+			return "", false, false, fmt.Errorf("unknown option: %s", arg)
+		} else if project != "" {
+			return "", false, false, fmt.Errorf("cloud %s requires exactly one project", command)
+		} else {
+			project = strings.TrimSpace(arg)
+			if project == "" {
+				return "", false, false, fmt.Errorf("cloud %s requires a non-empty project", command)
+			}
+		}
 	}
+	if project == "" {
+		return "", false, false, fmt.Errorf("usage: engram cloud %s <project> [--literal-project]", command)
+	}
+	return project, literal, false, nil
+}
 
-	projectName, warning, err := normalizeCloudCLIProjectInput(os.Args[3])
+func cmdCloudEnroll(cfg store.Config) {
+	input, literal, help, err := parseCloudProjectArgs("enroll")
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if help {
+		return
+	}
+	projectName, warning, err := normalizeCloudCLIProjectInput(input, literal)
 	if err != nil {
 		fatal(err)
 		return
@@ -788,19 +929,72 @@ func cmdCloudEnroll(cfg store.Config) {
 	fmt.Printf("✓ Project %q enrolled for cloud sync\n", projectName)
 }
 
-func normalizeCloudCLIProjectInput(input string) (string, string, error) {
-	decoded, err := url.PathUnescape(strings.TrimSpace(input))
-	if err != nil {
-		return "", "", fmt.Errorf("invalid cloud project URL encoding %q: %w", input, err)
+func normalizeCloudCLIProjectInput(input string, literal bool) (string, string, error) {
+	decoded := strings.TrimSpace(input)
+	if !literal {
+		var err error
+		decoded, err = url.PathUnescape(decoded)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid cloud project URL encoding %q: %w", input, err)
+		}
 	}
 	projectName, warning := store.NormalizeProject(decoded)
 	return projectName, warning, nil
 }
 
+func cmdCloudUnenroll(cfg store.Config) {
+	input, literal, help, err := parseCloudProjectArgs("unenroll")
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if help {
+		return
+	}
+	projectName, warning, err := normalizeCloudCLIProjectInput(input, literal)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.UnenrollProject(projectName); err != nil {
+		fatal(err)
+		return
+	}
+
+	fmt.Printf("✓ Project %q unenrolled from future cloud sync\n", projectName)
+	fmt.Println("Local data, remote data, and pending journal rows were preserved.")
+	fmt.Println("Note: an already in-flight push is not cancelled.")
+}
+
 func cmdCloudConfig(cfg store.Config) {
+	if len(os.Args) == 4 && os.Args[3] == "--clear" {
+		if err := cloudconfig.Clear(cfg.DataDir); err != nil {
+			fatal(err)
+			return
+		}
+		fmt.Println("✓ Persisted cloud server URL and token cleared")
+		if strings.TrimSpace(os.Getenv(cloudconfig.EnvCloudServer)) != "" {
+			fmt.Printf("Note: %s remains active and overrides the cleared persisted server URL.\n", cloudconfig.EnvCloudServer)
+		}
+		if strings.TrimSpace(os.Getenv(cloudconfig.EnvCloudToken)) != "" {
+			fmt.Printf("Note: %s remains active and overrides the cleared persisted token.\n", cloudconfig.EnvCloudToken)
+		}
+		return
+	}
 	if len(os.Args) < 5 || os.Args[3] != "--server" {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud config --server <url>")
+		fmt.Fprintln(os.Stderr, "usage: engram cloud config --server <url> | --clear")
 		exitFunc(1)
+		return
 	}
 	cc, err := cloudconfig.Load(cfg.DataDir)
 	if err != nil {
@@ -811,11 +1005,13 @@ func cmdCloudConfig(cfg store.Config) {
 	if cc.ServerURL == "" {
 		fmt.Fprintln(os.Stderr, "error: server URL is required")
 		exitFunc(1)
+		return
 	}
 	validatedURL, err := cloudconfig.ValidateServerURL(cc.ServerURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: invalid server URL: %v\n", err)
 		exitFunc(1)
+		return
 	}
 	cc.ServerURL = validatedURL
 	if err := cloudconfig.Save(cfg.DataDir, cc); err != nil {

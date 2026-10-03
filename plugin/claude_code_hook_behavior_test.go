@@ -1,7 +1,7 @@
 package plugin_test
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,8 +13,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -41,7 +44,7 @@ type hookPayload struct {
 	SystemMessage string `json:"systemMessage"`
 }
 
-// requireHookBinaries skips only when the host cannot run the Bash hooks.
+// requireHookBinaries skips only when the host cannot run the Bash hooks from this workspace.
 // hooks.json and the PowerShell fallback still have interpreter-free backstops.
 func requireHookBinaries(t *testing.T) {
 	t.Helper()
@@ -53,35 +56,78 @@ func requireHookBinaries(t *testing.T) {
 			t.Skipf("%s is not runnable - skipping Bash hook behavior tests: %v", bin, err)
 		}
 	}
+	_ = bashScriptPath(t, filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", "_helpers.sh"))
 }
 
-// user-prompt-submit.sh hardcodes /tmp for its session markers (line 188 uses
-// /tmp, not TMPDIR), so tests clean up by absolute path rather than t.TempDir.
+// Git Bash /tmp is not necessarily Go's /tmp on Windows. Ask the same Bash
+// used by the hooks to translate its default temp directory to a native path.
+func hookStateDir() string {
+	if runtime.GOOS != "windows" {
+		if dir := os.Getenv("TMPDIR"); dir != "" {
+			return dir
+		}
+		return "/tmp"
+	}
+	output, err := exec.Command("bash", "-c", `cygpath -w "${TMPDIR:-/tmp}"`).Output()
+	if err != nil {
+		panic(fmt.Sprintf("resolve Git Bash marker directory: %v", err))
+	}
+	return strings.TrimSpace(string(output))
+}
+
 func stateFilePath(sessionID string) string {
-	return filepath.Join("/tmp", "engram-claude-"+sessionID+"-tools-loaded")
+	return filepath.Join(hookStateDir(), "engram-claude-"+sessionID+"-tools-loaded")
 }
 
 func nudgeFilePath(sessionID string) string {
-	return filepath.Join("/tmp", "engram-claude-"+sessionID+"-last-nudge")
+	return filepath.Join(hookStateDir(), "engram-claude-"+sessionID+"-last-nudge")
 }
 
-// newSessionID derives a unique, deterministic UUID from the test name. This
-// matches the hook's unencoded session-key contract. It clears state left by an
-// interrupted earlier run so the first-message path is reachable, and registers
-// the same cleanup on exit.
+func TestNewSessionIDPreservesUnrelatedMarker(t *testing.T) {
+	requireHookBinaries(t)
+	outerID := newSessionID(t)
+	outerMarker := stateFilePath(outerID)
+	file, err := os.OpenFile(outerMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("create outer marker exclusively: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close outer marker: %v", err)
+	}
+
+	t.Run("inner cleanup", func(t *testing.T) {
+		innerID := newSessionID(t)
+		markSessionBootstrapped(t, innerID)
+	})
+	if _, err := os.Stat(outerMarker); err != nil {
+		t.Fatalf("outer marker must survive inner cleanup: %v", err)
+	}
+}
+
+// newSessionID creates an unpredictable per-run UUID. Cleanup only removes
+// markers belonging to this invocation, never markers from an earlier run.
 func newSessionID(t *testing.T) string {
 	t.Helper()
-	hash := sha256.Sum256([]byte(t.Name()))
-	id := hex.EncodeToString(hash[:16])
-	id = id[:12] + "4" + id[13:16] + "8" + id[17:]
-	id = id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
-
-	clean := func() {
-		os.Remove(stateFilePath(id))
-		os.Remove(nudgeFilePath(id))
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		t.Fatalf("generate session ID: %v", err)
 	}
-	clean()
-	t.Cleanup(clean)
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	id := hex.EncodeToString(bytes[:])
+	id = id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
+	for _, path := range []string{stateFilePath(id), nudgeFilePath(id)} {
+		if _, err := os.Stat(path); err == nil || !os.IsNotExist(err) {
+			t.Fatalf("refuse to reuse existing session marker %q: %v", path, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, path := range []string{stateFilePath(id), nudgeFilePath(id)} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove session marker %q: %v", path, err)
+			}
+		}
+	})
 	return id
 }
 
@@ -94,18 +140,50 @@ func runHook(t *testing.T, scriptName, stdin string, env map[string]string) stri
 	return stdout
 }
 
+// runHookInDir is runHook with an explicit working directory for the hook
+// process, used to exercise CLAUDE_CONFIG_DIR resolution against a relative
+// path (issue #1081). An empty dir behaves exactly like runHook.
+func runHookInDir(t *testing.T, scriptName, stdin string, env map[string]string, dir string) string {
+	t.Helper()
+	stdout, _ := runHookWithStderrInDir(t, scriptName, stdin, env, dir)
+	return stdout
+}
+
 func runHookWithStderr(t *testing.T, scriptName, stdin string, env map[string]string) (string, string) {
+	t.Helper()
+	return runHookWithStderrInDir(t, scriptName, stdin, env, "")
+}
+
+// runHookWithStderrInDir is runHookWithStderr with an explicit working
+// directory for the hook process; an empty dir uses the test process's own
+// working directory (the exec.Cmd default).
+func runHookWithStderrInDir(t *testing.T, scriptName, stdin string, env map[string]string, dir string) (string, string) {
 	t.Helper()
 	script := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", scriptName)
 
-	cmd := exec.Command("bash", script)
+	cmd := exec.Command("bash", bashScriptPath(t, script))
+	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
 	// Force the POSIX path: the Windows-safe branch short-circuits before the
 	// logic under test, and OSTYPE/MSYSTEM could otherwise leak in from the env.
 	cmd.Env = make([]string, 0, len(os.Environ())+len(env)+1)
 	for _, entry := range os.Environ() {
 		upper := strings.ToUpper(entry)
-		if strings.HasPrefix(upper, "ENGRAM_PORT=") || strings.HasPrefix(upper, "ENGRAM_SOCKET=") {
+		if strings.HasPrefix(upper, "ENGRAM_URL=") || strings.HasPrefix(upper, "ENGRAM_PORT=") || strings.HasPrefix(upper, "ENGRAM_SOCKET=") {
+			continue
+		}
+		// Skip any other entry the caller's env map overrides, so the
+		// override is never shadowed by an earlier duplicate key in envp.
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		// Keep hook tests hermetic: CLAUDE_CONFIG_DIR is unset unless the
+		// caller explicitly supplies it in env.
+		if strings.EqualFold(key, "CLAUDE_CONFIG_DIR") {
+			continue
+		}
+		if _, override := env[key]; override {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)
@@ -127,11 +205,11 @@ func runHookWithStderr(t *testing.T, scriptName, stdin string, env map[string]st
 func resolveClaudeHookURL(t *testing.T, env map[string]string) string {
 	t.Helper()
 	helper := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", "_helpers.sh")
-	cmd := exec.Command("bash", "-c", `source "$1"; printf '%s' "$ENGRAM_URL"`, "bash", helper)
+	cmd := exec.Command("bash", "-c", `source "$1"; printf '%s' "$ENGRAM_URL"`, "bash", bashScriptPath(t, helper))
 	cmd.Env = make([]string, 0, len(os.Environ())+len(env))
 	for _, entry := range os.Environ() {
 		upper := strings.ToUpper(entry)
-		if strings.HasPrefix(upper, "ENGRAM_PORT=") || strings.HasPrefix(upper, "ENGRAM_SOCKET=") {
+		if strings.HasPrefix(upper, "ENGRAM_URL=") || strings.HasPrefix(upper, "ENGRAM_PORT=") || strings.HasPrefix(upper, "ENGRAM_SOCKET=") {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)
@@ -146,10 +224,29 @@ func resolveClaudeHookURL(t *testing.T, env map[string]string) string {
 	return string(output)
 }
 
+func bashScriptPath(t *testing.T, path string) string {
+	t.Helper()
+	volume := filepath.VolumeName(path)
+	if len(volume) != 2 || volume[1] != ':' {
+		return path
+	}
+	remainder := strings.ReplaceAll(strings.TrimLeft(path[len(volume):], `\/`), `\`, "/")
+	for _, candidate := range []string{
+		"/" + strings.ToLower(volume[:1]) + "/" + remainder,
+		"/mnt/" + strings.ToLower(volume[:1]) + "/" + remainder,
+	} {
+		if exec.Command("bash", "-c", `[ -f "$1" ]`, "bash", candidate).Run() == nil {
+			return candidate
+		}
+	}
+	t.Skipf("bash cannot access hook script %q", path)
+	return ""
+}
+
 func normalizedClaudeHookMaxTime(t *testing.T, configured, callerDefault string) string {
 	t.Helper()
 	helper := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", "_helpers.sh")
-	cmd := exec.Command("bash", "-c", `source "$1" "__engram_hook_default_max_time=$2"; printf '%s' "$ENGRAM_HOOK_MAX_TIME"`, "bash", helper, callerDefault)
+	cmd := exec.Command("bash", "-c", `source "$1" "__engram_hook_default_max_time=$2"; printf '%s' "$ENGRAM_HOOK_MAX_TIME"`, "bash", bashScriptPath(t, helper), callerDefault)
 	cmd.Env = make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(entry), "ENGRAM_HOOK_MAX_TIME=") {
@@ -162,6 +259,25 @@ func normalizedClaudeHookMaxTime(t *testing.T, configured, callerDefault string)
 	output, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("normalize Claude hook max time: %v", err)
+	}
+	return string(output)
+}
+
+func resolveClaudeConfigRoot(t *testing.T, configured string) string {
+	t.Helper()
+	helper := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", "_helpers.sh")
+	cmd := exec.Command("bash", "-c", `source "$1"; claude_config_root`, "bash", bashScriptPath(t, helper))
+	cmd.Dir = t.TempDir()
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, "CLAUDE_CONFIG_DIR") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+configured)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("resolve Claude config root: %v", err)
 	}
 	return string(output)
 }
@@ -231,7 +347,7 @@ func serverPort(t *testing.T, srv *httptest.Server) string {
 // Unlike the PowerShell source parser in claude_code_hook_enforcement_test.go,
 // this parses runtime-emitted additionalContext, where a single select: anchor
 // has no comment-marker ambiguity.
-func selectNames(t *testing.T, additionalContext string) map[string]bool {
+func selectNames(t *testing.T, additionalContext string) []string {
 	t.Helper()
 	idx := strings.Index(additionalContext, "select:")
 	if idx < 0 {
@@ -241,39 +357,33 @@ func selectNames(t *testing.T, additionalContext string) map[string]bool {
 	if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
 		rest = rest[:nl]
 	}
-	set := make(map[string]bool)
+	var names []string
 	for _, name := range strings.Split(rest, ",") {
 		if name = strings.TrimSpace(name); name != "" {
-			set[name] = true
+			names = append(names, name)
 		}
 	}
-	return set
+	return names
 }
 
 var claudeCodeBootstrapTools = []string{
 	"mem_save", "mem_search", "mem_context", "mem_session_summary",
 	"mem_session_start", "mem_session_end", "mem_get_observation",
 	"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
-	"mem_update", "mem_current_project", "mem_judge",
+	"mem_update", "mem_current_project", "mem_judge", "mem_doctor",
+	"mem_review", "mem_pin", "mem_unpin",
 }
 
-func assertToolSearchNames(t *testing.T, listed map[string]bool) {
+func assertToolSearchNames(t *testing.T, listed []string) {
 	t.Helper()
-	want := make(map[string]bool, len(claudeCodeBootstrapTools)*2)
-	for _, prefix := range []string{"mcp__engram__", "mcp__plugin_engram_engram__"} {
+	want := make([]string, 0, len(claudeCodeBootstrapTools)*2)
+	for _, prefix := range []string{"mcp__plugin_engram_engram__", "mcp__engram__"} {
 		for _, tool := range claudeCodeBootstrapTools {
-			want[prefix+tool] = true
+			want = append(want, prefix+tool)
 		}
 	}
-	for name := range want {
-		if !listed[name] {
-			t.Errorf("emitted select: list is missing %q", name)
-		}
-	}
-	for name := range listed {
-		if !want[name] {
-			t.Errorf("emitted select: list contains unexpected name %q", name)
-		}
+	if !equalStrings(listed, want) {
+		t.Errorf("emitted select: list = %q, want %q", listed, want)
 	}
 }
 
@@ -510,6 +620,10 @@ func TestSubagentStopPayloadHandling(t *testing.T) {
 		{"TestSubagentStopFallsBackToStdout", "sess-fallback", "", "from stdout", "from stdout"},
 		{"TestSubagentStopSkipsEmptyPayload", "sess-empty", "", "", ""},
 		{"TestSubagentStopPreservesShellMetacharacters", "sess-quoting", tricky, "", tricky},
+		{"TestSubagentStopPreservesBareCR", "sess-bare-cr", "before\rafter", "", "before\rafter"},
+		{"TestSubagentStopPreservesOriginalCRLF", "sess-crlf", "first\r\nsecond", "", "first\r\nsecond"},
+		{"TestSubagentStopPreservesLFAndBareCR", "sess-mixed", "first\nsecond\rthird", "", "first\nsecond\rthird"},
+		{"TestSubagentStopPreservesTrailingLF", "sess-trailing", "first\n", "", "first\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			requireHookBinaries(t)
@@ -542,6 +656,41 @@ func TestSubagentStopPayloadHandling(t *testing.T) {
 			}
 			if got[0].SessionID != tt.sessionID || got[0].Source != "subagent-stop" {
 				t.Errorf("passive capture = %+v, want session_id %q and source subagent-stop", got[0], tt.sessionID)
+			}
+		})
+	}
+}
+
+func TestSubagentStopExplicitEmptyMessageSelection(t *testing.T) {
+	for _, tt := range []struct {
+		name, primary, stdout, want string
+	}{
+		{"primary wins", "primary", "fallback", "primary"},
+		{"empty primary falls back", "", "fallback", "fallback"},
+		{"both empty skip capture", "", "", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requireHookBinaries(t)
+			srv, captured := captureServer(t)
+			input, err := json.Marshal(struct {
+				SessionID            string `json:"session_id"`
+				CWD                  string `json:"cwd"`
+				LastAssistantMessage string `json:"last_assistant_message"`
+				Stdout               string `json:"stdout"`
+			}{"explicit-fields", t.TempDir(), tt.primary, tt.stdout})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runHook(t, "subagent-stop.sh", string(input), map[string]string{"ENGRAM_PORT": serverPort(t, srv)})
+			got := captured()
+			if tt.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("unexpected passive POSTs: %+v", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Content != tt.want || got[0].SessionID != "explicit-fields" || got[0].Source != "subagent-stop" || got[0].Project != "engram" {
+				t.Fatalf("passive POSTs = %+v, want one capture of %q", got, tt.want)
 			}
 		})
 	}
@@ -642,6 +791,46 @@ func TestClaudeHookWhitespacePortFallsBackToDefault(t *testing.T) {
 	}
 }
 
+func TestClaudeHookEnvironmentFiltersInheritedEngramURL(t *testing.T) {
+	t.Setenv("ENGRAM_URL", "http://127.0.0.1:1")
+	if got, want := resolveClaudeHookURL(t, map[string]string{"ENGRAM_PORT": "8123"}), "http://127.0.0.1:8123"; got != want {
+		t.Fatalf("inherited ENGRAM_URL leaked into helper: got %q, want %q", got, want)
+	}
+	if got, want := resolveClaudeHookURL(t, map[string]string{"ENGRAM_URL": "http://127.0.0.1:9999"}), "http://127.0.0.1:9999"; got != want {
+		t.Fatalf("explicit ENGRAM_URL = %q, want %q", got, want)
+	}
+}
+
+func TestCodexSessionStartWhitespaceURLUsesManagedLocalMode(t *testing.T) {
+	requireHookBinaries(t)
+	srv := healthyServer(t)
+	stubDir := writeRecordingEngramStub(t)
+	logPath := filepath.Join(t.TempDir(), "engram-invocations.log")
+	script := bashScriptPath(t, filepath.Join(repoRoot(t), "plugin", "codex", "scripts", "session-start.sh"))
+	cmd := exec.Command("bash", script)
+	cmd.Stdin = strings.NewReader(fmt.Sprintf(`{"session_id":%q,"cwd":%q}`, "codex-session", t.TempDir()))
+	for _, entry := range os.Environ() {
+		upper := strings.ToUpper(entry)
+		if strings.HasPrefix(upper, "ENGRAM_URL=") || strings.HasPrefix(upper, "ENGRAM_PORT=") || strings.HasPrefix(upper, "ENGRAM_SOCKET=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
+	cmd.Env = append(cmd.Env,
+		"ENGRAM_URL= \t ",
+		"ENGRAM_PORT="+serverPort(t, srv),
+		"PATH="+stubDir+":"+os.Getenv("PATH"),
+		"ENGRAM_TEST_ENGRAM_LOG="+logPath,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Codex session-start must exit successfully: %v\n%s", err, output)
+	}
+
+	if got := readEngramInvocations(t, logPath); len(got) != 1 || got[0] != "instance-id" {
+		t.Fatalf("whitespace ENGRAM_URL selected external mode; invocations = %v, want [instance-id]", got)
+	}
+}
+
 func TestClaudeHookMaxTimeNormalization(t *testing.T) {
 	for _, tt := range []struct {
 		name, configured, callerDefault, want string
@@ -668,6 +857,23 @@ func TestClaudeHookMaxTimeNormalization(t *testing.T) {
 	}
 }
 
+func TestClaudeConfigRootRecognizesWindowsAbsolutePaths(t *testing.T) {
+	requireHookBinaries(t)
+	for _, tt := range []struct {
+		name, configured, want string
+	}{
+		{name: "drive with forward slashes", configured: " \tC:/Users/test/.claude\t ", want: "C:/Users/test/.claude"},
+		{name: "drive with backslashes", configured: `C:\Users\test\.claude`, want: `C:\Users\test\.claude`},
+		{name: "UNC", configured: `\\server\share\.claude`, want: `\\server\share\.claude`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveClaudeConfigRoot(t, tt.configured); got != tt.want {
+				t.Fatalf("claude_config_root() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUserPromptMaxTimeFallbackReachesDirectCurlCalls(t *testing.T) {
 	if got, want := capturedUserPromptMaxTimes(t, "0"), []string{"0.2", "2", "0.2", "0.2", "0.2", "0.2"}; !equalStrings(got, want) {
 		t.Fatalf("curl --max-time values = %q, want %q", got, want)
@@ -684,4 +890,189 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// writeRecordingEngramStub writes a fake `engram` binary that logs each invocation's args to $ENGRAM_TEST_ENGRAM_LOG and exits 0.
+func writeRecordingEngramStub(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "engram")
+	content := "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$ENGRAM_TEST_ENGRAM_LOG\"\nif [ \"$*\" = \"instance-id\" ]; then printf '00000000000000000000000000000000\\n'; fi\nexit 0\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write recording engram stub: %v", err)
+	}
+	return dir
+}
+
+func writeMigratingEngramStub(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "engram")
+	content := "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$ENGRAM_TEST_ENGRAM_LOG\"\nif [ \"$*\" = \"instance-id\" ]; then printf '00000000000000000000000000000000\\n'; fi\nif [ \"$*\" = \"setup claude-code --mcp-only\" ]; then\n  mkdir -p \"$(dirname \"$ENGRAM_TEST_MCP_CONFIG\")\"\n  printf '{}' > \"$ENGRAM_TEST_MCP_CONFIG\"\nfi\nexit 0\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write migrating engram stub: %v", err)
+	}
+	return dir
+}
+
+// readEngramInvocations returns the argument lists recorded by writeRecordingEngramStub, in call order.
+func readEngramInvocations(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read engram invocation log: %v", err)
+	}
+	trimmed := strings.TrimSuffix(string(data), "\n")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+// healthyServer answers 200 to /health and 404 to everything else.
+func healthyServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"instance_id":"00000000000000000000000000000000"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestSessionStartRegistersProjectOwnedClaudeSession(t *testing.T) {
+	requireHookBinaries(t)
+
+	var registered struct {
+		ID            string `json:"id"`
+		Project       string `json:"project"`
+		Directory     string `json:"directory"`
+		OwnershipMode string `json:"ownership_mode"`
+	}
+	var registrations int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/project/current":
+			_, _ = io.WriteString(w, `{"project":"engram","project_source":"config"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
+			if err := json.NewDecoder(r.Body).Decode(&registered); err != nil {
+				t.Errorf("decode session registration: %v", err)
+				return
+			}
+			registrations++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	stubDir := t.TempDir()
+	stub := filepath.Join(stubDir, "engram")
+	if err := os.WriteFile(stub, []byte("#!/bin/bash\nif [ \"$*\" = \"protocol-mode claude-code\" ]; then printf 'slim\\n'; fi\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write engram stub: %v", err)
+	}
+	cwd := t.TempDir()
+	runHook(t, "session-start.sh", `{"session_id":"claude-parent-session","cwd":`+strconv.Quote(cwd)+`}`,
+		map[string]string{
+			"ENGRAM_URL": srv.URL,
+			"PATH":       stubDir + ":" + os.Getenv("PATH"),
+		})
+
+	if registrations != 1 {
+		t.Fatalf("session registrations = %d, want 1", registrations)
+	}
+	if registered.ID != "claude-parent-session" || registered.Project != "engram" || registered.Directory != cwd {
+		t.Fatalf("session registration = %#v, want Claude authoritative session and resolved project", registered)
+	}
+	if registered.OwnershipMode != "project_owned" {
+		t.Fatalf("ownership_mode = %q, want project_owned", registered.OwnershipMode)
+	}
+}
+
+func TestSessionStartSkipsClaudeMCPRegistration(t *testing.T) {
+	requireHookBinaries(t)
+
+	run := func(t *testing.T, setupFails bool) ([]string, string) {
+		t.Helper()
+		var registrations, contexts atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/health":
+				_, _ = io.WriteString(w, `{"instance_id":"00000000000000000000000000000000"}`)
+			case "/project/current":
+				_, _ = io.WriteString(w, `{"project":"engram","project_source":"config"}`)
+			case "/sessions":
+				registrations.Add(1)
+				w.WriteHeader(http.StatusCreated)
+			case "/context":
+				contexts.Add(1)
+				_, _ = io.WriteString(w, `{"context":"isolated session memory"}`)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		stubDir := t.TempDir()
+		logPath := filepath.Join(t.TempDir(), "engram-invocations.log")
+		stub := filepath.Join(stubDir, "engram")
+		script := "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$ENGRAM_TEST_ENGRAM_LOG\"\nif [ \"$*\" = \"instance-id\" ]; then printf '00000000000000000000000000000000\\n'; fi\n"
+		if setupFails {
+			script += "if [ \"$*\" = \"setup claude-code --mcp-only\" ]; then exit 1; fi\n"
+		}
+		script += "exit 0\n"
+		if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+			t.Fatalf("write engram stub: %v", err)
+		}
+
+		configDir := t.TempDir()
+		legacyPath := filepath.Join(configDir, "mcp", "engram.json")
+		if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+			t.Fatalf("create stale MCP directory: %v", err)
+		}
+		if err := os.WriteFile(legacyPath, []byte(`{"command":"stale"}`), 0o644); err != nil {
+			t.Fatalf("write stale MCP config: %v", err)
+		}
+		env := map[string]string{
+			"ENGRAM_PORT":            serverPort(t, srv),
+			"ENGRAM_MANAGED_LOCAL":   "0",
+			"CLAUDE_CONFIG_DIR":      configDir,
+			"HOME":                   t.TempDir(),
+			"PATH":                   stubDir + ":" + os.Getenv("PATH"),
+			"ENGRAM_TEST_ENGRAM_LOG": logPath,
+		}
+		stdin := fmt.Sprintf(`{"session_id":%q,"cwd":%q}`, newSessionID(t), t.TempDir())
+		var stderr string
+		for i := 0; i < 2; i++ {
+			stdout, errOutput := runHookWithStderr(t, "session-start.sh", stdin, env)
+			stderr += errOutput
+			if !strings.Contains(stdout, "isolated session memory") {
+				t.Fatalf("invocation %d missing memory context: %q", i+1, stdout)
+			}
+		}
+		if gotRegistrations, gotContexts := registrations.Load(), contexts.Load(); gotRegistrations != 2 || gotContexts != 2 {
+			t.Fatalf("registrations/context requests = %d/%d, want 2/2", gotRegistrations, gotContexts)
+		}
+		return readEngramInvocations(t, logPath), stderr
+	}
+
+	for _, setupFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("setupFails=%t", setupFails), func(t *testing.T) {
+			invocations, stderr := run(t, setupFails)
+			for _, invocation := range invocations {
+				if strings.HasPrefix(invocation, "setup ") {
+					t.Fatalf("SessionStart must not invoke setup: %v", invocations)
+				}
+			}
+			if stderr != "" {
+				t.Fatalf("SessionStart stderr = %q, want no registration warning", stderr)
+			}
+		})
+	}
 }
