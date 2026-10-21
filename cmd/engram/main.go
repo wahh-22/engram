@@ -4020,7 +4020,8 @@ Environment:
   ENGRAM_CLOUD_MAX_PUSH_BYTES
                       Max cloud push payload bytes (default: 8388608)
   ENGRAM_CLOUD_CLIENT_TIMEOUT_SECONDS
-                      Cloud client HTTP timeout in seconds (default: 30)
+                      Cloud client HTTP timeout in seconds, chunk writes included
+                      (default: 30; chunk writes default to 300)
   ENGRAM_CLOUD_TOKEN Bearer token required in authenticated cloud serve mode
   ENGRAM_CLOUD_INSECURE_NO_AUTH
                      Set to 1 ONLY for local insecure cloud serve mode (no auth)

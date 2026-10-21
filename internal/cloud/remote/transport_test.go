@@ -254,6 +254,26 @@ func TestCloudHTTPClientTimeoutDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestCloudHTTPClientTimeoutOverrideAppliesToChunkWrites(t *testing.T) {
+	t.Setenv(cloudHTTPTimeoutEnvVar, "")
+	rt, err := NewRemoteTransport("https://cloud.example.test", "token", "proj-a")
+	if err != nil {
+		t.Fatalf("NewRemoteTransport: %v", err)
+	}
+	if rt.writeHTTPClient.Timeout != writeChunkTimeout {
+		t.Fatalf("expected default chunk write timeout %s, got %s", writeChunkTimeout, rt.writeHTTPClient.Timeout)
+	}
+
+	t.Setenv(cloudHTTPTimeoutEnvVar, "75")
+	rt, err = NewRemoteTransport("https://cloud.example.test", "token", "proj-a")
+	if err != nil {
+		t.Fatalf("NewRemoteTransport: %v", err)
+	}
+	if rt.writeHTTPClient.Timeout != 75*time.Second {
+		t.Fatalf("expected overridden chunk write timeout %s, got %s", 75*time.Second, rt.writeHTTPClient.Timeout)
+	}
+}
+
 func TestReadManifestParsesMachineActionableErrorPayload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

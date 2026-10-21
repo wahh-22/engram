@@ -106,20 +106,36 @@ func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error
 		token:           token,
 		project:         project,
 		httpClient:      newRemoteHTTPClient(cloudHTTPClientTimeout(), token),
-		writeHTTPClient: newRemoteHTTPClient(writeChunkTimeout, token),
+		writeHTTPClient: newRemoteHTTPClient(cloudWriteChunkTimeout(), token),
 	}, nil
 }
 
 func cloudHTTPClientTimeout() time.Duration {
+	if timeout, ok := cloudHTTPClientTimeoutOverride(); ok {
+		return timeout
+	}
+	return defaultCloudHTTPTimeout
+}
+
+// cloudWriteChunkTimeout keeps the longer chunk-write default unless the user
+// explicitly set a client timeout, which then applies to chunk writes too.
+func cloudWriteChunkTimeout() time.Duration {
+	if timeout, ok := cloudHTTPClientTimeoutOverride(); ok {
+		return timeout
+	}
+	return writeChunkTimeout
+}
+
+func cloudHTTPClientTimeoutOverride() (time.Duration, bool) {
 	value := strings.TrimSpace(os.Getenv(cloudHTTPTimeoutEnvVar))
 	if value == "" {
-		return defaultCloudHTTPTimeout
+		return 0, false
 	}
 	seconds, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || seconds <= 0 || seconds > maxCloudHTTPTimeoutSecs {
-		return defaultCloudHTTPTimeout
+		return 0, false
 	}
-	return time.Duration(seconds) * time.Second
+	return time.Duration(seconds) * time.Second, true
 }
 
 func validateBearerBaseURL(baseURL, token string) (string, string, error) {
