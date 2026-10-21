@@ -1829,3 +1829,81 @@ func TestSetDashboardAllowedProjectsInvalidatesCachedReadModel(t *testing.T) {
 		t.Fatalf("expected allowlist update to invalidate read-model cache, got load count %d", loadCalls)
 	}
 }
+
+// Postgres rejects NUL in jsonb and text ("unsupported Unicode escape sequence",
+// SQLSTATE 22P05). A single observation carrying one used to fail every push of
+// its project with a 500, and the client retried that same batch forever.
+func TestInsertMutationBatchAcceptsPayloadsContainingNUL(t *testing.T) {
+	dsn := os.Getenv("CLOUDSTORE_TEST_DSN")
+	if dsn == "" {
+		t.Skip("CLOUDSTORE_TEST_DSN not set — skipping integration test (requires Postgres)")
+	}
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		t.Skip("test requires URL-style CLOUDSTORE_TEST_DSN so a per-test search_path can be attached")
+	}
+
+	schema := fmt.Sprintf("cloudstore_nul_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	testDSN := dsn + "?search_path=" + schema
+	if strings.Contains(dsn, "?") {
+		testDSN = dsn + "&search_path=" + schema
+	}
+	cs, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cs.Close()
+
+	ctx := context.Background()
+	const project = "proj-nul"
+	sessionPayload := json.RawMessage(`{"id":"sess-nul","project":"proj-nul","directory":"/work/p","started_at":"2026-05-04T01:45:00Z"}`)
+	// "\u0000" is a real NUL; "\\u0000" is the six-character literal text, which
+	// must survive untouched.
+	obsPayload := json.RawMessage(`{"sync_id":"obs-nul","session_id":"sess-nul","type":"discovery","title":"nul\u0000title","content":"real\u0000nul and literal \\u0000 text","project":"proj-nul","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	seqs, err := cs.InsertMutationBatch(ctx, []MutationEntry{
+		{Project: project, Entity: store.SyncEntitySession, EntityKey: "sess-nul", Op: store.SyncOpUpsert, Payload: sessionPayload},
+		{Project: project, Entity: store.SyncEntityObservation, EntityKey: "obs-nul", Op: store.SyncOpUpsert, Payload: obsPayload},
+	})
+	if err != nil {
+		t.Fatalf("InsertMutationBatch must accept a payload containing NUL: %v", err)
+	}
+	if len(seqs) != 2 {
+		t.Fatalf("expected 2 accepted seqs, got %v", seqs)
+	}
+
+	var stored []byte
+	if err := cs.db.QueryRowContext(ctx, `SELECT payload FROM cloud_mutations WHERE seq = $1`, seqs[1]).Scan(&stored); err != nil {
+		t.Fatalf("read stored mutation: %v", err)
+	}
+	var obs struct {
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(stored, &obs); err != nil {
+		t.Fatalf("decode stored mutation: %v", err)
+	}
+	if obs.Title != "nul\uFFFDtitle" {
+		t.Fatalf("stored title = %q, want NUL replaced by U+FFFD", obs.Title)
+	}
+	if obs.Content != `real`+"\uFFFD"+`nul and literal \u0000 text` {
+		t.Fatalf("stored content = %q, want NUL replaced and literal escape text preserved", obs.Content)
+	}
+
+	var chunkCount int
+	if err := cs.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cloud_chunks WHERE project_name = $1`, project).Scan(&chunkCount); err != nil {
+		t.Fatalf("count chunks: %v", err)
+	}
+	if chunkCount != 1 {
+		t.Fatalf("expected the batch to materialize one chunk, got %d", chunkCount)
+	}
+}

@@ -1,6 +1,7 @@
 package cloudstore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -1041,6 +1042,7 @@ func (cs *CloudStore) InsertMutationBatch(ctx context.Context, batch []MutationE
 	if len(batch) == 0 {
 		return []int64{}, nil
 	}
+	batch = withPostgresSafePayloads(batch)
 	chunks, err := materializedMutationBatchChunks(batch)
 	if err != nil {
 		return nil, err
@@ -1110,6 +1112,87 @@ func (cs *CloudStore) InsertMutationBatch(ctx context.Context, batch []MutationE
 		cs.invalidateDashboardReadModel()
 	}
 	return seqs, nil
+}
+
+// withPostgresSafePayloads returns the batch with NUL characters replaced in
+// every payload. Postgres cannot store NUL in jsonb or text (SQLSTATE 22P05),
+// so a single such payload would otherwise reject its whole batch on every
+// retry. Entries are copied; the caller's slice is left untouched.
+func withPostgresSafePayloads(batch []MutationEntry) []MutationEntry {
+	var out []MutationEntry
+	for i, entry := range batch {
+		safe, changed := replaceJSONNUL(entry.Payload)
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = append([]MutationEntry(nil), batch...)
+		}
+		out[i].Payload = safe
+	}
+	if out == nil {
+		return batch
+	}
+	return out
+}
+
+// replaceJSONNUL replaces NUL characters inside JSON string keys and values with
+// U+FFFD. Payloads without a decoded NUL are returned byte-for-byte unchanged,
+// including ones that only carry the escaped literal text `\\u0000`.
+func replaceJSONNUL(payload json.RawMessage) (json.RawMessage, bool) {
+	if !bytes.Contains(payload, []byte(`\u0000`)) {
+		return payload, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		// Leave malformed payloads to the regular validation path.
+		return payload, false
+	}
+	value, changed := replaceNULInValue(value)
+	if !changed {
+		return payload, false
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return payload, false
+	}
+	return json.RawMessage(bytes.TrimRight(buf.Bytes(), "\n")), true
+}
+
+func replaceNULInValue(value any) (any, bool) {
+	switch v := value.(type) {
+	case string:
+		if !strings.Contains(v, "\x00") {
+			return v, false
+		}
+		return strings.ReplaceAll(v, "\x00", "\uFFFD"), true
+	case []any:
+		changed := false
+		for i, item := range v {
+			next, itemChanged := replaceNULInValue(item)
+			if itemChanged {
+				v[i] = next
+				changed = true
+			}
+		}
+		return v, changed
+	case map[string]any:
+		changed := false
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			next, itemChanged := replaceNULInValue(item)
+			safeKey, keyChanged := replaceNULInValue(key)
+			changed = changed || itemChanged || keyChanged
+			out[safeKey.(string)] = next
+		}
+		return out, changed
+	default:
+		return value, false
+	}
 }
 
 const mutationBackfillChunkSize = 100
